@@ -10,11 +10,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync } from "node:fs";
-import { NETWORK_DISABLED, networkEnabled } from "./network.js";
+import { NETWORK_DISABLED, configuredFetch, networkEnabled } from "./network.js";
 import * as DB from "./db.js";
 import { reviewBatch } from "./review-queue.js";
 import { readJourneyState } from "./state.js";
-import { FETCHABLE_ATS_PLATFORMS, resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
+import { FETCHABLE_ATS_PLATFORMS, resolveAts, fetchBoard, fetchBoardPage, BoardUnreachable, type AtsPlatform, type DetailMode } from "./ats.js";
 import { detectBoard } from "./board-id.js";
 import { fetchUserRepos, enrichRepo, type RepoFacts } from "./github.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
@@ -255,6 +255,9 @@ export function registerTools(server: McpServer): void {
       interview_id: z.number().int().optional(),
       board_id: z.number().int().optional(),
       stale_hours: z.number().nonnegative().optional(),
+      tag: z.string().optional(),
+      full: z.boolean().optional(),
+      offset: z.number().int().nonnegative().optional(),
       with_market_overlay: z.boolean().optional(),
       limit: z.number().int().positive().optional(),
     },
@@ -282,11 +285,20 @@ export function registerTools(server: McpServer): void {
           if (!stats) return json({ ok: false, error: `no board ${a.board_id}.` });
           return json({ stats });
         }
-        const boards = a.stale_hours !== undefined ? DB.staleBoards(a.stale_hours) : DB.listBoardStats();
-        const limited = boards.slice(0, a.limit ?? 500);
-        const out: Record<string, unknown> = { boards: limited };
+        const detail = a.full === true;
+        const limit = a.limit ?? 100;
+        const offset = a.offset ?? 0;
+        const boards = a.stale_hours !== undefined
+          ? DB.staleBoards(a.stale_hours, new Date(), { tag: a.tag, limit: limit + 1, offset, detail })
+          : DB.listBoardStats(new Date(), { tag: a.tag, limit: limit + 1, offset, detail });
+        const more = boards.length > limit;
+        const page = more ? boards.slice(0, limit) : boards;
+        const shown = detail ? page : page.map(compactBoard);
+        const out: Record<string, unknown> = { boards: shown, limit, offset };
+        if (more) out.next_offset = offset + limit;
         if (a.stale_hours !== undefined) out.older_than_hours = a.stale_hours;
-        if (limited.length === 0) out.note = "no boards registered. The ledger is empty — register_board, or `jobbot boards add` from a shell. seeds/companies.json is not copied in.";
+        if (a.tag) out.tag = a.tag;
+        if (page.length === 0) out.note = "no boards registered. The ledger is empty — register_board, or `jobbot boards add` from a shell. seeds/companies.json is not copied in.";
         return json(out);
       } catch (e) { return json({ ok: false, error: errMsg(e) }); }
     }
@@ -746,7 +758,7 @@ export function registerTools(server: McpServer): void {
     description:
       "Fetch public data and persist it. dry_run:true previews with no requests or writes; omit dry_run (or pass false) to run. " +
       "step: 'find_companies' (resolve ATS slugs for named companies, or read the local curated roster; provider:'theirstack' is opt-in via THEIRSTACK_API_KEY), " +
-      "'fetch_jobs' (pull live Greenhouse, Ashby, Lever, Workable, Workday, or SmartRecruiters boards; a registered ledger board records a check event), " +
+      "'fetch_jobs' (pull a bounded batch of live Greenhouse, Ashby, Lever, Workable, Workday, or SmartRecruiters boards and return next_cursor; list fields by default, details none|new|all; a registered ledger board records a check. Long runs belong on `jobbot boards check`), " +
       "'ingest_portfolio' (public GitHub repos). " +
       "Workday keys are tenant.wdN.site. SmartRecruiters keys are the company identifier. " +
       "JOBBOT_NETWORK=off refuses live calls unless an offline adapter was injected. LinkedIn hosts are refused. Nothing is auto-applied and no message is sent.",
@@ -760,6 +772,9 @@ export function registerTools(server: McpServer): void {
       ats_platform: enumOf([...FETCHABLE_ATS_PLATFORMS]).optional(), ats_slug: z.string().optional(), company_id: z.number().int().optional(),
       github_handle: z.string().optional(), include_forks: z.boolean().optional(), enrich_max: z.number().int().nonnegative().optional(),
       dry_run: z.boolean().optional(), limit: z.number().int().positive().optional(),
+      cursor: z.number().int().nonnegative().optional(),
+      details: enumOf(["none", "new", "all"]).optional(),
+      max_postings: z.number().int().positive().optional(),
     },
   }, async (a) => {
     switch (a.step) {
@@ -846,11 +861,27 @@ export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
   return json(out);
 }
 
+function compactBoard(board: DB.BoardStats) {
+  return {
+    id: board.id, name: board.name, board_type: board.board_type, board_key: board.board_key,
+    active: board.active, tags: board.tags, domain: board.domain, careers_url: board.careers_url,
+    company_id: board.company_id, last_checked_at: board.last_checked_at,
+    last_success_at: board.last_success_at, last_attempt_at: board.last_attempt_at,
+    hours_since_last_check: board.hours_since_last_check, consecutive_failures: board.consecutive_failures,
+    last_error: board.last_error, total_checks: board.total_checks,
+    open_postings_seen: board.open_postings_seen, applications_submitted: board.applications_submitted,
+  };
+}
+
 // ── fetch_jobs orchestration ──────────────────────────────────────────────────
-interface FetchArgs { dry_run?: boolean; ats_platform?: string; ats_slug?: string; company_id?: number; limit?: number }
+interface FetchArgs {
+  dry_run?: boolean; ats_platform?: string; ats_slug?: string; company_id?: number; limit?: number;
+  cursor?: number; details?: string; max_postings?: number;
+}
 interface FetchTarget { company_id: number; platform: AtsPlatform; slug: string; name: string }
 interface FetchDeps { fetchBoardFn?: typeof fetchBoard; sleep?: (ms: number) => Promise<void>; politeDelayMs?: number }
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const GATHER_BATCH = 5;
 
 function rememberCheck(entry: Record<string, unknown>, input: Parameters<typeof DB.recordBoardFetch>[0]): void {
   try {
@@ -862,10 +893,10 @@ function rememberCheck(entry: Record<string, unknown>, input: Parameters<typeof 
 export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
   if (a.dry_run === true) return preview("fetch_jobs", a);
   if (!networkEnabled() && !deps.fetchBoardFn) return networkDisabled();
-  const fetchBoardFn = deps.fetchBoardFn ?? fetchBoard;
   const sleep = deps.sleep ?? realSleep;
   const politeDelayMs = deps.politeDelayMs ?? 1000;
   const targets: FetchTarget[] = [];
+  let next_cursor: number | null = null;
   if (a.ats_platform && a.ats_slug) {
     const platform = a.ats_platform as AtsPlatform;
     const existing = DB.getCompanyByAts(platform, a.ats_slug);
@@ -877,39 +908,57 @@ export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
     if (!c.ats_platform || !c.ats_slug) return json({ ok: false, error: `company ${a.company_id} (${c.name}) has no ATS slug — resolve via gather('find_companies') first.` });
     targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug, name: c.name });
   } else {
-    for (const c of DB.getResolvedCompanies(a.limit ?? 25)) targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug!, name: c.name });
+    const page = DB.getResolvedCompaniesPage(a.cursor ?? 0, a.limit ?? GATHER_BATCH);
+    next_cursor = page.next_cursor;
+    for (const c of page.companies) targets.push({ company_id: c.id, platform: c.ats_platform as AtsPlatform, slug: c.ats_slug!, name: c.name });
   }
-  if (targets.length === 0) return json({ ok: true, boards_fetched: 0, note: "no resolved companies — discover some via gather('find_companies'), or target a board with ats_platform + ats_slug." });
+  if (targets.length === 0) return json({ ok: true, boards_fetched: 0, next_cursor, note: "no resolved companies — discover some via gather('find_companies'), or target a board with ats_platform + ats_slug." });
 
   const totals = { inserted: 0, updated: 0, closed: 0 };
   const per_company: Record<string, unknown>[] = [];
   let unreachable = 0;
+  const details: DetailMode = a.details === "new" || a.details === "all" ? a.details : "none";
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
     if (i > 0 && politeDelayMs > 0) await sleep(politeDelayMs);
     let board: Awaited<ReturnType<typeof fetchBoard>> = null;
     let failure: string | undefined;
-    try { board = await fetchBoardFn(t.platform, t.slug); }
-    catch (e) { board = null; failure = errMsg(e); }
+    let httpStatus: number | null = null;
+    let truncated = false;
+    try {
+      if (deps.fetchBoardFn) board = await deps.fetchBoardFn(t.platform, t.slug);
+      else {
+        const known = details === "new" ? new Set(DB.jobSourceUrls(t.company_id)) : undefined;
+        const page = await fetchBoardPage(t.platform, t.slug, configuredFetch, { details, maxPostings: a.max_postings, knownUrls: known });
+        board = page.jobs;
+        truncated = page.truncated;
+      }
+    } catch (e) {
+      board = null;
+      failure = errMsg(e);
+      if (e instanceof BoardUnreachable) httpStatus = e.status;
+    }
     if (board === null) {
       unreachable++;
-      const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true, error: failure ?? "unreachable" };
-      rememberCheck(entry, { board_type: t.platform, board_key: t.slug, company_id: t.company_id, unreachable: true, error: failure, seen: 0, updated: 0, new_postings: [], returned_postings: [], closed_postings: [] });
+      const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true, error: failure ?? "unreachable", ...(httpStatus != null ? { http_status: httpStatus } : {}) };
+      rememberCheck(entry, { board_type: t.platform, board_key: t.slug, company_id: t.company_id, unreachable: true, error: failure, http_status: httpStatus, seen: 0, updated: 0, new_postings: [], returned_postings: [], closed_postings: [] });
       per_company.push(entry);
       continue;
     }
-    const r = DB.upsertJobs(t.company_id, board);
+    const r = DB.upsertJobs(t.company_id, board, { closeMissing: !truncated });
     totals.inserted += r.inserted; totals.updated += r.updated; totals.closed += r.closed;
-    const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, ...r };
+    const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, truncated, ...r };
     rememberCheck(entry, {
-      board_type: t.platform, board_key: t.slug, company_id: t.company_id, seen: r.seen, updated: r.updated,
+      board_type: t.platform, board_key: t.slug, company_id: t.company_id, seen: r.seen, updated: r.updated, truncated,
       new_postings: r.new_postings, returned_postings: r.returned_postings, closed_postings: r.closed_postings,
     });
     per_company.push(entry);
   }
   return json({
-    ok: true, boards_fetched: targets.length - unreachable, unreachable, jobs: totals, per_company, catalog: readJourneyState().catalog,
-    next: totals.inserted + totals.updated > 0 ? "grade the new jobs — look({ at: 'jobs', scope: 'worklist' }), then grade_job." : "no live postings found (or all unreachable).",
+    ok: true, boards_fetched: targets.length - unreachable, unreachable, next_cursor, jobs: totals, per_company, catalog: readJourneyState().catalog,
+    next: next_cursor != null
+      ? `pass cursor:${next_cursor} to continue this batch. A long check belongs on \`jobbot boards check\`.`
+      : totals.inserted + totals.updated > 0 ? "grade the new jobs — look({ at: 'jobs', scope: 'worklist' }), then grade_job." : "no live postings found (or all unreachable).",
   });
 }
 

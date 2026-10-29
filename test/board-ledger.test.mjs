@@ -227,29 +227,29 @@ describe("board ledger", { concurrency: false }, () => {
     assert.equal(globalCalls, 0);
   });
 
-  test("CLI adds, lists, and appends JSON for a shell assistant", () => {
+  test("CLI adds, lists, and appends JSON for a shell assistant", async () => {
     const added = io();
-    assert.equal(runBoardCli(["add", "--name", "CLI Studio", "--type", "smartrecruiters", "--key", "clistudio", "--tags", "game-studio", "--json"], added), 0);
+    assert.equal(await runBoardCli(["add", "--name", "CLI Studio", "--type", "smartrecruiters", "--key", "clistudio", "--tags", "game-studio", "--json"], added), 0);
     const body = JSON.parse(added.output[0]);
     assert.equal(body.inserted, true);
     assert.equal(body.stats.board_type, "smartrecruiters");
     assert.equal(body.stats.total_checks, 0);
     assert.deepEqual(body.stats.tags, ["game-studio"]);
     const noted = io();
-    assert.equal(runBoardCli(["event", "--id", String(body.id), "--kind", "note", "--summary", "recruiter intro", "--json"], noted), 0);
+    assert.equal(await runBoardCli(["event", "--id", String(body.id), "--kind", "note", "--summary", "recruiter intro", "--json"], noted), 0);
     assert.equal(JSON.parse(noted.output[0]).event.kind, "note");
     const feed = io();
-    assert.equal(runBoardCli(["events", "--id", String(body.id), "--json"], feed), 0);
+    assert.equal(await runBoardCli(["events", "--id", String(body.id), "--json"], feed), 0);
     assert.equal(JSON.parse(feed.output[0]).events[0].summary, "recruiter intro");
     const stale = io();
-    assert.equal(runBoardCli(["stale", "--hours", "24", "--json"], stale), 0);
+    assert.equal(await runBoardCli(["stale", "--hours", "24", "--json"], stale), 0);
     const names = JSON.parse(stale.output[0]).boards.map((board) => board.name);
     assert.equal(names.includes("CLI Studio"), true);
     const usage = io();
-    assert.equal(runBoardCli(["nope"], usage), 2);
+    assert.equal(await runBoardCli(["nope"], usage), 2);
     assert.match(usage.errors.join("\n"), /jobbot boards/);
     const help = io();
-    assert.equal(runBoardCli(["--help"], help), 0);
+    assert.equal(await runBoardCli(["--help"], help), 0);
     assert.match(help.output.join("\n"), /jobbot boards add/);
     assert.equal(globalCalls, 0);
   });

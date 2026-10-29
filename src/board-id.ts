@@ -40,6 +40,14 @@ function slug(value: string | undefined): string | null {
   const key = value.trim().toLowerCase();
   return SLUG.test(key) ? key : null;
 }
+// Lever's postings path is case-sensitive (Convai is not convai). The other
+// public boards accept any case, so those keys stay lowercase and re-imports
+// do not fork a second row.
+function preserveSlug(value: string | undefined): string | null {
+  if (!value) return null;
+  const key = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,120}$/.test(key) ? key : null;
+}
 
 function isLocale(segment: string): boolean {
   return /^[a-z]{2}-[a-z]{2}$/i.test(segment);
@@ -173,8 +181,8 @@ function ashbyKey(url: URL): string | null {
 function leverKey(url: URL): string | null {
   const host = url.hostname.toLowerCase();
   const parts = url.pathname.split("/").filter(Boolean);
-  if (host === "jobs.lever.co") return slug(parts[0]);
-  if (host === "api.lever.co" && parts[0] === "v0" && parts[1] === "postings") return slug(parts[2]);
+  if (host === "jobs.lever.co") return preserveSlug(parts[0]);
+  if (host === "api.lever.co" && parts[0] === "v0" && parts[1] === "postings") return preserveSlug(parts[2]);
   return null;
 }
 
