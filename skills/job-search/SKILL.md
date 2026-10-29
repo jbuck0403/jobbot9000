@@ -11,7 +11,7 @@ You're the market analyst and matchmaker: gather raw, grade honestly, then match
 - `orient` at the start — it resumes any open thread and tells you if the profile is still unverified (if so, do **jobbot9000:verify** first; searching on an unverified band mis-targets everything).
 
 ## Discover companies (populate the catalog)
-The reachable universe is companies on the four ATSes, so the **free path reaches everyone reachable**. Escalate only as recall demands:
+The free slug probe reaches companies on Ashby, Greenhouse, Lever, and Workable. Workday and SmartRecruiters are fetched when you pin them (`tenant.wdN.site`, or the SmartRecruiters company identifier). `detect_board` / `jobbot boards detect <url>` reads the identifier off a careers URL. Escalate only as recall demands:
 1. **On-demand (zero-config):** `gather({ step: 'find_companies', companies: [{ name: 'Stripe', domain: 'stripe.com' }] })`. If a slug isn't derivable (e.g. Glean → Greenhouse `gleanwork`), **pin it**: `companies: [{ name, ats_platform, ats_slug }]`.
 2. **Curated roster (free, default):** no args → the local seed roster (`seeds/companies.json`).
 3. **TheirStack (opt-in, paid):** `provider: 'theirstack'` + `THEIRSTACK_API_KEY`, with a query you build from the resume. `dry_run: true` is a free count; a paid pull gates on the per-run credit ceiling.
@@ -19,9 +19,9 @@ The reachable universe is companies on the four ATSes, so the **free path reache
 Re-runs dedup on domain. Greenhouse / Ashby / Lever are verified; **Workable is best-effort**.
 
 ## Fetch jobs (→ raw, ungraded)
-`gather({ step: 'fetch_jobs' })` — one board (`ats_platform`+`ats_slug` or `company_id`) or all resolved (pass nothing). Idempotent; a liveness pass closes vanished postings; grades survive a refetch. This is a live HTTPS GET unless `JOBBOT_NETWORK=off`. `dry_run: true` previews and writes nothing. Pass `dry_run: false` only when you mean the same thing as omitting it.
+`gather({ step: 'fetch_jobs' })` — one board (`ats_platform`+`ats_slug` or `company_id`) or all resolved (pass nothing). Idempotent; a liveness pass closes vanished postings; grades survive a refetch. This is a live public fetch unless `JOBBOT_NETWORK=off`. `dry_run: true` previews and writes nothing. Pass `dry_run: false` only when you mean the same thing as omitting it. Workday slugs look like `nature.wd108.externalcareers`. SmartRecruiters slugs are the company identifier.
 
-If that company is in the board ledger (`register_board`, or `jobbot boards add`), the fetch appends a check event. Register studios you want a "hours since last check" for; fetching an unregistered slug does not create a ledger row. See `docs/LEDGER.md`. Workday, SmartRecruiters, and browser careers pages can be registered now; only the four ATS fetchers run.
+If that company is in the board ledger (`register_board`, or `jobbot boards add`), the fetch appends a check event, including a Workday or SmartRecruiters failure (wrong `wd` number, renamed site, HTTP error). Register studios you want a "hours since last check" for; fetching an unregistered slug does not create a ledger row. See `docs/LEDGER.md`. `custom` and `browser` careers pages can be registered now; there is still no browser fetcher.
 
 ## Grade + match (your judgment)
 1. `look({ at: 'jobs', scope: 'worklist' })` → the grading queue.

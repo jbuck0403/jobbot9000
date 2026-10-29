@@ -14,7 +14,8 @@ import { NETWORK_DISABLED, networkEnabled } from "./network.js";
 import * as DB from "./db.js";
 import { reviewBatch } from "./review-queue.js";
 import { readJourneyState } from "./state.js";
-import { resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
+import { FETCHABLE_ATS_PLATFORMS, resolveAts, fetchBoard, type AtsPlatform } from "./ats.js";
+import { detectBoard } from "./board-id.js";
 import { fetchUserRepos, enrichRepo, type RepoFacts } from "./github.js";
 import { PROVIDERS, type DiscoverQuery, type DiscoveredCompany, type ProviderContext } from "./providers.js";
 
@@ -688,8 +689,9 @@ export function registerTools(server: McpServer): void {
   server.registerTool("register_board", {
     description:
       "Register or update one company job board in the ledger. Does not fetch, seed, apply, or send. " +
-      "board_type is an open slug: greenhouse, ashby, lever, workable, and also workday, smartrecruiters, custom, or browser before those fetchers exist. " +
-      "board_key is the public board slug when there is one. The same type+key updates mutable fields (name, domain, careers URL, tags, notes, active) and does not rewrite events. " +
+      "board_type is an open slug. gather fetches greenhouse, ashby, lever, workable, workday, and smartrecruiters. custom and browser stay manual. " +
+      "workday board_key is tenant.wdN.site, or pass a myworkdayjobs.com careers URL and the key is parsed. smartrecruiters board_key is the company identifier. " +
+      "The same type+key updates mutable fields (name, domain, careers URL, tags, notes, active) and does not rewrite events. " +
       "A registered board gets a check event automatically the next time gather fetch_jobs pulls that slug. Ships with no companies.",
     inputSchema: {
       name: z.string(),
@@ -728,22 +730,34 @@ export function registerTools(server: McpServer): void {
     } catch (e) { return json({ ok: false, error: errMsg(e) }); }
   });
 
+  server.registerTool("detect_board", {
+    description:
+      "Detect which public ATS a careers URL uses and return the board identifier. " +
+      "Recognizes greenhouse, ashby, lever, workable, workday (tenant + wd number + site), and smartrecruiters. " +
+      "Anything else is custom — register it as browser if a person will open the page. Does not fetch, register, apply, or send. LinkedIn hosts are rejected.",
+    inputSchema: { url: z.string() },
+  }, async (a) => {
+    try { return json({ ok: true, ...detectBoard(a.url) }); }
+    catch (e) { return json({ ok: false, error: errMsg(e) }); }
+  });
+
   // ── gather: the one door to the outside world (sync cut in v2) ─────────────
   server.registerTool("gather", {
     description:
       "Fetch public data and persist it. dry_run:true previews with no requests or writes; omit dry_run (or pass false) to run. " +
       "step: 'find_companies' (resolve ATS slugs for named companies, or read the local curated roster; provider:'theirstack' is opt-in via THEIRSTACK_API_KEY), " +
-      "'fetch_jobs' (pull live Greenhouse, Ashby, Lever, or Workable boards; a registered ledger board records a check event), " +
+      "'fetch_jobs' (pull live Greenhouse, Ashby, Lever, Workable, Workday, or SmartRecruiters boards; a registered ledger board records a check event), " +
       "'ingest_portfolio' (public GitHub repos). " +
+      "Workday keys are tenant.wdN.site. SmartRecruiters keys are the company identifier. " +
       "JOBBOT_NETWORK=off refuses live calls unless an offline adapter was injected. LinkedIn hosts are refused. Nothing is auto-applied and no message is sent.",
     inputSchema: {
       step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio"]),
-      companies: z.array(z.object({ name: z.string(), domain: z.string().optional(), ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(), ats_slug: z.string().optional() })).optional(),
+      companies: z.array(z.object({ name: z.string(), domain: z.string().optional(), ats_platform: enumOf([...FETCHABLE_ATS_PLATFORMS]).optional(), ats_slug: z.string().optional() })).optional(),
       titles: z.array(z.string()).optional(), technologies: z.array(z.string()).optional(),
       seniority: enumOf(["junior", "mid_level", "senior", "staff", "c_level"]).optional(),
       locations: z.array(z.string()).optional(), posted_within_days: z.number().int().positive().optional(),
       provider: z.string().optional(), max_credits: z.number().int().positive().optional(), confirm: z.boolean().optional(), niche: z.string().optional(),
-      ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(), ats_slug: z.string().optional(), company_id: z.number().int().optional(),
+      ats_platform: enumOf([...FETCHABLE_ATS_PLATFORMS]).optional(), ats_slug: z.string().optional(), company_id: z.number().int().optional(),
       github_handle: z.string().optional(), include_forks: z.boolean().optional(), enrich_max: z.number().int().nonnegative().optional(),
       dry_run: z.boolean().optional(), limit: z.number().int().positive().optional(),
     },
@@ -873,11 +887,14 @@ export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
     if (i > 0 && politeDelayMs > 0) await sleep(politeDelayMs);
-    let board; try { board = await fetchBoardFn(t.platform, t.slug); } catch { board = null; }
+    let board: Awaited<ReturnType<typeof fetchBoard>> = null;
+    let failure: string | undefined;
+    try { board = await fetchBoardFn(t.platform, t.slug); }
+    catch (e) { board = null; failure = errMsg(e); }
     if (board === null) {
       unreachable++;
-      const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true };
-      rememberCheck(entry, { board_type: t.platform, board_key: t.slug, company_id: t.company_id, unreachable: true, seen: 0, updated: 0, new_postings: [], returned_postings: [], closed_postings: [] });
+      const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true, error: failure ?? "unreachable" };
+      rememberCheck(entry, { board_type: t.platform, board_key: t.slug, company_id: t.company_id, unreachable: true, error: failure, seen: 0, updated: 0, new_postings: [], returned_postings: [], closed_postings: [] });
       per_company.push(entry);
       continue;
     }

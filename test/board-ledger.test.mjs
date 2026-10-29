@@ -87,7 +87,7 @@ describe("board ledger", { concurrency: false }, () => {
   });
 
   test("registers extensible board types and answers hours, checks, and stale", () => {
-    const never = DB.registerBoard({ name: "Never Studio", board_type: "workday", board_key: "neverstudio", tags: ["game-studio"], careers_url: "https://careers.example.test/never" });
+    const never = DB.registerBoard({ name: "Never Studio", board_type: "workday", board_key: "never.wd5.external", tags: ["game-studio"] });
     const paused = DB.registerBoard({ name: "Paused Studio", board_type: "custom", active: false, notes: "paused" });
     const stale = DB.registerBoard({ name: "Stale Studio", board_type: "smartrecruiters", board_key: "stalestudio", tags: ["game-studio"] });
     const fresh = DB.registerBoard({ name: "Fresh Studio", board_type: "browser", careers_url: "https://careers.example.test/fresh" });

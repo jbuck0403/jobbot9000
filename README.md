@@ -1,6 +1,6 @@
 # jobbot9000
 
-> **Public ATS fetch is live by default.** `gather` reads Greenhouse, Ashby, Lever, and Workable boards with keyless HTTPS GET. Set `JOBBOT_NETWORK=off` for a hermetic run (the test suite does). `dry_run: true` previews with no requests or writes. TheirStack stays opt-in (`THEIRSTACK_API_KEY`). Nothing is auto-applied and no messages are sent. LinkedIn hosts are refused. The offline discovery loop, people collection, and execution stages still have no live transport.
+> **Public ATS fetch is live by default.** `gather` reads Greenhouse, Ashby, Lever, Workable, Workday, and SmartRecruiters boards. Workday is a public JSON search on `{tenant}.wd{N}.myworkdayjobs.com`; the others are keyless HTTPS reads. Set `JOBBOT_NETWORK=off` for a hermetic run (the test suite does). `dry_run: true` previews with no requests or writes. TheirStack stays opt-in (`THEIRSTACK_API_KEY`). Nothing is auto-applied and no messages are sent. LinkedIn hosts are refused. The offline discovery loop, people collection, and execution stages still have no live transport.
 
 A local, market-aware **job-search readiness loop** for your AI agent — packaged as a **Claude Code plugin**. One install bundles an MCP server (which reads the real job market and holds your journey) and the skills that drive it. Your agent is the brain; this is its senses and memory. Nothing is hosted, no keys leave your machine, and the whole journey persists locally across sessions that may span months.
 
@@ -51,13 +51,14 @@ Two rules hold everywhere:
 
 **Two data planes:** **Personal** (profile, desires, resume, competency profile, interviews, plan, applications, journal) is **always local, never shared.** **Catalog** (companies + their live jobs — public market data) is local. Nothing leaves the machine.
 
-## The surface — 18 tools
+## The surface — 19 tools
 
 **Three doors:**
 
 - **`orient(detail?)`** — start every session here. Where the user is in the loop, the next best action (`recommended_skill` — the router, priority-ordered over the loop's edges so every state has a way forward), **open threads to resume**, and the recent journal. `detail`: `recommend` (default), `dashboard` (the competency profile, market gap, plan, notes).
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `boards` / `board` / `board_events` (the job-board ledger), `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
-- **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards; records a ledger check when that board is registered), `ingest_portfolio` (public GitHub repos + verification signals). Omit `dry_run` to run; `dry_run: true` previews. `JOBBOT_NETWORK=off` refuses live calls.
+- **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards, including Workday `tenant.wdN.site` and SmartRecruiters company identifiers; records a ledger check when that board is registered), `ingest_portfolio` (public GitHub repos + verification signals). Omit `dry_run` to run; `dry_run: true` previews. `JOBBOT_NETWORK=off` refuses live calls.
+- **`detect_board(url)`** — read-only. Given a careers URL, returns the ATS and board identifier (`greenhouse`, `ashby`, `lever`, `workable`, `workday`, `smartrecruiters`), or `custom` when none match. Does not fetch or register. The shell form is `jobbot boards detect <url> --json`.
 
 **Fourteen writes** — seven mechanical, seven judgment (each governed by a mode):
 
@@ -90,7 +91,7 @@ The competency profile is **multi-dimensional** — `technical_depth`, `system_d
 
 Five playbooks, invoked automatically by their `description` (and as `/jobbot9000:<name>`): **coach** (onboard + assess), **verify** (the competency interview), **upskill** (plan + resume + projects), **job-search** (discover + grade + match), **application** (rehearse + apply + track). Each opens with `orient`, so any session resumes the loop.
 
-Company discovery and live job fetching are **keyless and free by default**; TheirStack is an **opt-in paid accelerator** (`THEIRSTACK_API_KEY`, count-first, credit-ceiling-gated). Greenhouse / Ashby / Lever are verified against live boards; Workable is best-effort.
+Company discovery and live job fetching are **keyless and free by default**; TheirStack is an **opt-in paid accelerator** (`THEIRSTACK_API_KEY`, count-first, credit-ceiling-gated). Greenhouse / Ashby / Lever / Workday / SmartRecruiters are verified against live boards; Workable is best-effort. Slug resolution still probes only Ashby, Greenhouse, Lever, and Workable — pin a Workday or SmartRecruiters board, or detect it from the careers URL.
 
 ## Install (Claude Code)
 
@@ -109,7 +110,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 18 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 19 tools`.
 
 **Requires Node 22.13+** (24 LTS or newer recommended) — that's where Node's built-in SQLite (`node:sqlite`) is available unflagged.
 
@@ -149,10 +150,11 @@ src/
   board-ledger.ts            company/board registry + append-only check/application events (empty until you register)
   sqlite.ts                  the SQLite driver — node:sqlite (built into Node), so there is no native dep to rebuild
   state.ts                   the loop state machine (state derived from what data exists)
-  tools.ts                   the 18-tool surface
+  tools.ts                   the 19-tool surface
   network.ts                 live public fetch, JOBBOT_NETWORK=off, LinkedIn host block
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in)
-  ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
+  ats.ts                     keyless ATS — slug resolution + board fetch (Ashby/Greenhouse/Lever/Workable/Workday/SmartRecruiters)
+  board-id.ts                careers-URL detector and Workday/SmartRecruiters identifier parsing
   github.ts                  keyless GitHub sense — public repos + verification signals (authorship/traction/badges)
   board-cli.ts, cli.ts       `jobbot boards` plus the private review commands
 seeds/                       curated company roster (free default for find_companies); ships empty

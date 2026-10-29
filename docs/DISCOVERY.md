@@ -3,8 +3,8 @@
 Stage (a) exposes a bounded library loop for an owner to test with synthetic
 company, career-page and ATS fixtures. It has no installed network transport,
 MCP registration, CLI, people discovery, sender or submission executor. The
-separate `gather` door can fetch public Greenhouse, Ashby, Lever, and Workable
-boards unless `JOBBOT_NETWORK=off`. This discovery-loop library still has no
+separate `gather` door can fetch public Greenhouse, Ashby, Lever, Workable,
+Workday, and SmartRecruiters boards unless `JOBBOT_NETWORK=off`. This discovery-loop library still has no
 live transport, and no environment setting enables one here. This does not
 authorize any live discovery or real candidate input.
 
