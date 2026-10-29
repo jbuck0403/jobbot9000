@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TMP = mkdtempSync(join(tmpdir(), "jbdisc-"));
+process.env.JOBBOT_NETWORK = "off";
 process.env.JOBBOT_PRIVATE_DIR = join(TMP, ".private");
 process.env.STATE_DIR = join(TMP, ".private", "state");
 const SEEDS = join(TMP, "seeds.json");
@@ -173,8 +174,10 @@ eq([acomp[1].comp_min, acomp[1].comp_max], [null, null], "ashby: no comp -> null
 
 // ── J. upsertJobs liveness (direct) ───────────────────────────────────────────
 const cid = DB.upsertCompany({ name: "LiveCo", domain: "liveco.com", ats_platform: "greenhouse", ats_slug: "liveco" }).id;
-eq(DB.upsertJobs(cid, [{ source_url: "u1", title: "A" }, { source_url: "u2", title: "B" }]), { inserted: 2, updated: 0, closed: 0, seen: 2 }, "upsertJobs: initial insert");
-eq(DB.upsertJobs(cid, [{ source_url: "u1", title: "A2" }]), { inserted: 0, updated: 1, closed: 1, seen: 1 }, "upsertJobs: update u1, close vanished u2 (liveness)");
+const insertedJobs = DB.upsertJobs(cid, [{ source_url: "u1", title: "A" }, { source_url: "u2", title: "B" }]);
+eq([insertedJobs.inserted, insertedJobs.updated, insertedJobs.closed, insertedJobs.seen, insertedJobs.new_postings.length], [2, 0, 0, 2, 2], "upsertJobs: initial insert");
+const closedJobs = DB.upsertJobs(cid, [{ source_url: "u1", title: "A2" }]);
+eq([closedJobs.inserted, closedJobs.updated, closedJobs.closed, closedJobs.seen, closedJobs.closed_postings.length], [0, 1, 1, 1, 1], "upsertJobs: update u1, close vanished u2 (liveness)");
 eq(live(cid), 1, "upsertJobs: only u1 live after u2 closed");
 eq([DB.upsertJobs(cid, [{ source_url: "u1" }, { source_url: "u2" }]).inserted, live(cid)], [0, 2], "upsertJobs: u2 reopens (update, not insert)");
 eq(DB.upsertJobs(cid, []).closed, 2, "upsertJobs: empty feed closes all live");

@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync } from "node:fs";
-import { NETWORK_DISABLED } from "./network.js";
+import { NETWORK_DISABLED, networkEnabled } from "./network.js";
 import * as DB from "./db.js";
 import { reviewBatch } from "./review-queue.js";
 import { readJourneyState } from "./state.js";
@@ -241,9 +241,9 @@ export function registerTools(server: McpServer): void {
   // ── look: the one read door (never fetches, never writes) ──────────────────
   server.registerTool("look", {
     description:
-      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (open/latest session, scoped to job_id when supplied, or exact interview_id; explicit IDs never fall back, both IDs must match; includes Q/A/exemplars/deltas and all_sessions for selection). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
+      `The one read door — never fetches, never writes, safe in any order. at='jobs' lists by scope: 'market' (whole catalog), 'relevant' (your band ±1 with role fit; levels ${ladder}), 'worklist' (the grading queue). Filters apply to all scopes: titles_any (string[] OR-match title), location (substring), remote (true), query (title/company), grading_status. at='companies'. at='boards' lists the job-board ledger (optional stale_hours: active boards not checked in that many hours, including never-checked). at='board' needs board_id and returns that company's stats. at='board_events' is the append-only feed (optional board_id, limit). at='resume' (with_market_overlay adds computed demand; revision history is in at='history'). at='portfolio' (ranked by relevance + verification signals + overlay). at='profile' (identity + desires). at='competency' (the multi-dimensional profile + derived band + gaps — the assessment). at='interview' (open/latest session, scoped to job_id when supplied, or exact interview_id; explicit IDs never fall back, both IDs must match; includes Q/A/exemplars/deltas and all_sessions for selection). at='plan' (the upskilling plan by status). at='packet' (needs job_id: job+grade+skills+resume+role_fit+ranked portfolio+letter+application+honesty gating). at='applications' (the funnel). at='history' (the journal timeline — what happened, when). Returns JSON to interpret.`,
     inputSchema: {
-      at: enumOf(["jobs", "companies", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "history"]),
+      at: enumOf(["jobs", "companies", "boards", "board", "board_events", "resume", "portfolio", "profile", "competency", "interview", "plan", "packet", "applications", "history"]),
       scope: enumOf(["relevant", "market", "worklist"]).optional(),
       query: z.string().optional(),
       titles_any: z.array(z.string()).optional(),
@@ -252,6 +252,8 @@ export function registerTools(server: McpServer): void {
       grading_status: enumOf(["ungraded", "graded", "any"]).optional(),
       job_id: z.number().int().optional(),
       interview_id: z.number().int().optional(),
+      board_id: z.number().int().optional(),
+      stale_hours: z.number().nonnegative().optional(),
       with_market_overlay: z.boolean().optional(),
       limit: z.number().int().positive().optional(),
     },
@@ -263,6 +265,29 @@ export function registerTools(server: McpServer): void {
       const out: Record<string, unknown> = { companies };
       if (companies.length === 0) out.note = "no companies yet — run gather({ step: 'find_companies' }).";
       return json(out);
+    }
+
+    if (a.at === "boards" || a.at === "board" || a.at === "board_events") {
+      try {
+        if (a.at === "board_events") {
+          const events = DB.recentBoardEvents({ board_id: a.board_id, limit: a.limit });
+          const out: Record<string, unknown> = { events };
+          if (events.length === 0) out.note = "no board events yet — register_board, then gather fetch_jobs or record_board_event.";
+          return json(out);
+        }
+        if (a.at === "board") {
+          if (a.board_id === undefined) return json({ ok: false, error: "look({ at: 'board' }) needs a board_id." });
+          const stats = DB.boardStats(a.board_id);
+          if (!stats) return json({ ok: false, error: `no board ${a.board_id}.` });
+          return json({ stats });
+        }
+        const boards = a.stale_hours !== undefined ? DB.staleBoards(a.stale_hours) : DB.listBoardStats();
+        const limited = boards.slice(0, a.limit ?? 500);
+        const out: Record<string, unknown> = { boards: limited };
+        if (a.stale_hours !== undefined) out.older_than_hours = a.stale_hours;
+        if (limited.length === 0) out.note = "no boards registered. The ledger is empty — register_board, or `jobbot boards add` from a shell. seeds/companies.json is not copied in.";
+        return json(out);
+      } catch (e) { return json({ ok: false, error: errMsg(e) }); }
     }
 
     if (a.at === "profile") {
@@ -660,14 +685,57 @@ export function registerTools(server: McpServer): void {
     return json(out);
   });
 
+  server.registerTool("register_board", {
+    description:
+      "Register or update one company job board in the ledger. Does not fetch, seed, apply, or send. " +
+      "board_type is an open slug: greenhouse, ashby, lever, workable, and also workday, smartrecruiters, custom, or browser before those fetchers exist. " +
+      "board_key is the public board slug when there is one. The same type+key updates mutable fields (name, domain, careers URL, tags, notes, active) and does not rewrite events. " +
+      "A registered board gets a check event automatically the next time gather fetch_jobs pulls that slug. Ships with no companies.",
+    inputSchema: {
+      name: z.string(),
+      board_type: z.string(),
+      board_key: z.string().nullable().optional(),
+      domain: z.string().nullable().optional(),
+      careers_url: z.string().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+      notes: z.string().nullable().optional(),
+      active: z.boolean().optional(),
+    },
+  }, async (a) => {
+    try {
+      const saved = DB.registerBoard(a);
+      return json({ ok: true, ...saved, stats: DB.boardStats(saved.id) });
+    } catch (e) { return json({ ok: false, error: errMsg(e) }); }
+  });
+
+  server.registerTool("record_board_event", {
+    description:
+      "Append one ledger event for a registered board. Append-only: events are never updated or deleted. " +
+      "kind is a short snake_case slug. Known kinds: board_checked (manual or browser; method defaults to manual), posting_seen, posting_gone, posting_returned, application_submitted, application_status, note, contact. " +
+      "Other kinds are stored and show up in the feed. Pass job_id only when that job already exists; it is copied onto the event. Does not fetch or send.",
+    inputSchema: {
+      board_id: z.number().int(),
+      kind: z.string(),
+      summary: z.string(),
+      payload: z.record(z.string(), z.unknown()).optional(),
+      job_id: z.number().int().optional(),
+      ts: z.string().optional(),
+    },
+  }, async (a) => {
+    try {
+      const event = DB.appendBoardEvent(a);
+      return json({ ok: true, event, stats: DB.boardStats(a.board_id) });
+    } catch (e) { return json({ ok: false, error: errMsg(e) }); }
+  });
+
   // ── gather: the one door to the outside world (sync cut in v2) ─────────────
   server.registerTool("gather", {
     description:
-      "Dry-run by default: preview locally with no requests or writes. Network execution is disabled in this foundation; explicit dry_run:false requires injected offline adapters. step: " +
-      "'find_companies' (preview company inputs or a discovery query; explicit local execution can persist pinned boards or curated slug-complete seeds), " +
-      "'fetch_jobs' (preview ATS board targets; execution requires an injected board adapter), " +
-      "'ingest_portfolio' (preview public GitHub portfolio ingestion; execution requires injected list and enrichment adapters). " +
-      "No send or submit capability. Network adapters are unavailable through this MCP surface.",
+      "Fetch public data and persist it. dry_run:true previews with no requests or writes; omit dry_run (or pass false) to run. " +
+      "step: 'find_companies' (resolve ATS slugs for named companies, or read the local curated roster; provider:'theirstack' is opt-in via THEIRSTACK_API_KEY), " +
+      "'fetch_jobs' (pull live Greenhouse, Ashby, Lever, or Workable boards; a registered ledger board records a check event), " +
+      "'ingest_portfolio' (public GitHub repos). " +
+      "JOBBOT_NETWORK=off refuses live calls unless an offline adapter was injected. LinkedIn hosts are refused. Nothing is auto-applied and no message is sent.",
     inputSchema: {
       step: enumOf(["find_companies", "fetch_jobs", "ingest_portfolio"]),
       companies: z.array(z.object({ name: z.string(), domain: z.string().optional(), ats_platform: enumOf(["ashby", "greenhouse", "lever", "workable"]).optional(), ats_slug: z.string().optional() })).optional(),
@@ -721,14 +789,16 @@ const nextNote = () => "resolved companies are ready — pull their live boards 
 const networkDisabled = () => json({ ok: false, code: "network_disabled", error: NETWORK_DISABLED });
 const preview = (step: string, input: unknown) => json({
   ok: true, dry_run: true, step, preview: input,
-  note: "Local preview only: no adapter calls, credential reads or writes. Live network is disabled.",
+  note: "Local preview only: no requests, credential reads, or writes. Omit dry_run or pass dry_run:false to fetch. JOBBOT_NETWORK=off keeps a run hermetic.",
 });
+const needsResolve = (companies: { ats_platform?: string | null; ats_slug?: string | null }[]) =>
+  companies.some((c) => !(c.ats_platform && c.ats_slug));
 
 export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
-  if (a.dry_run !== false) return preview("find_companies", a);
+  if (a.dry_run === true) return preview("find_companies", a);
   const resolve = deps.resolve ?? resolveAts;
   if (a.companies?.length) {
-    if (!deps.resolve && a.companies.some((c) => !(c.ats_platform && c.ats_slug))) return networkDisabled();
+    if (!networkEnabled() && !deps.resolve && needsResolve(a.companies)) return networkDisabled();
     const discovered: DiscoveredCompany[] = a.companies.map((c) => ({
       name: c.name, domain: c.domain ?? null, tags: [], source: "manual",
       ats_platform: (c.ats_platform && c.ats_slug) ? c.ats_platform : null,
@@ -743,18 +813,22 @@ export async function findCompanies(a: FindArgs, deps: FindDeps = {}) {
   const providerName = a.provider ?? Object.keys(PROVIDERS)[0];
   const provider = PROVIDERS[providerName];
   if (!provider) return json({ ok: false, error: `unknown provider '${providerName}' — available: ${Object.keys(PROVIDERS).join(", ")}` });
-  if (provider.requiresKey && (!deps.ctx?.fetchFn || !deps.resolve)) return networkDisabled();
-  const ctx = deps.ctx ?? {};
-  if (!provider.available(ctx)) return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — an injected offline context must supply a synthetic key. Local curated and pinned-company paths need no key." : "."}` });
+  if (provider.requiresKey && !networkEnabled() && (!deps.ctx?.fetchFn || !deps.resolve)) return networkDisabled();
+  const ctx = { ...(networkEnabled() ? { apiKey: process.env.THEIRSTACK_API_KEY } : {}), ...deps.ctx };
+  if (!provider.available(ctx)) return json({ ok: false, error: `provider '${provider.name}' is unavailable${provider.requiresKey ? " — set THEIRSTACK_API_KEY to opt in. With JOBBOT_NETWORK=off, pass an injected offline context instead. The free curated roster and pinned companies need no key." : "."}` });
   const q: DiscoverQuery = { titles: a.titles, technologies: a.technologies, seniority: a.seniority ?? null, locations: a.locations, posted_within_days: a.posted_within_days, limit: a.limit };
   let est; try { est = await provider.estimate(q, ctx); } catch (e) { return json({ ok: false, error: `discovery pre-flight failed: ${errMsg(e)}` }); }
   const ceiling = a.max_credits ?? MAX_CREDITS_PER_RUN;
   if (est.projected_credits > ceiling && !a.confirm) return json({ ok: false, confirmation_required: true, provider: provider.name, estimate: est, ceiling, note: `projected ~${est.projected_credits} credits exceeds the ceiling (${ceiling}). Re-run with confirm:true, or lower limit / raise max_credits.` });
   let result; try { result = await provider.discover(q, ctx); } catch (e) { return json({ ok: false, error: `discovery failed: ${errMsg(e)}` }); }
-  if (!deps.resolve && result.companies.some((c) => !(c.ats_platform && c.ats_slug))) return networkDisabled();
+  if (!networkEnabled() && !deps.resolve && needsResolve(result.companies)) return networkDisabled();
   const persisted = await persistDiscovered(result.companies, resolve);
   const out: Record<string, unknown> = { ok: true, provider: provider.name, estimate: est, credits_spent: result.records_billed, discovered: result.companies.length, persisted, catalog: readJourneyState().catalog, next: nextNote() };
-  if (result.companies.length === 0 && provider.name === "curated") out.note = "the curated seed roster is empty. Preview company inputs, or configure local slug-complete seeds; live discovery remains disabled.";
+  if (result.companies.length === 0 && provider.name === "curated") {
+    out.note = networkEnabled()
+      ? "the curated seed roster is empty. Name companies directly — gather({ step: 'find_companies', companies: [{ name, domain }] }) — or add to seeds/companies.json, or set THEIRSTACK_API_KEY."
+      : "the curated seed roster is empty. Preview company inputs, or configure local slug-complete seeds; live discovery remains disabled (JOBBOT_NETWORK=off).";
+  }
   return json(out);
 }
 
@@ -764,10 +838,17 @@ interface FetchTarget { company_id: number; platform: AtsPlatform; slug: string;
 interface FetchDeps { fetchBoardFn?: typeof fetchBoard; sleep?: (ms: number) => Promise<void>; politeDelayMs?: number }
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+function rememberCheck(entry: Record<string, unknown>, input: Parameters<typeof DB.recordBoardFetch>[0]): void {
+  try {
+    const ledger = DB.recordBoardFetch(input);
+    if (ledger.recorded) entry.ledger = ledger;
+  } catch (e) { entry.ledger_error = errMsg(e); }
+}
+
 export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
-  if (a.dry_run !== false) return preview("fetch_jobs", a);
-  if (!deps.fetchBoardFn) return networkDisabled();
-  const fetchBoardFn = deps.fetchBoardFn;
+  if (a.dry_run === true) return preview("fetch_jobs", a);
+  if (!networkEnabled() && !deps.fetchBoardFn) return networkDisabled();
+  const fetchBoardFn = deps.fetchBoardFn ?? fetchBoard;
   const sleep = deps.sleep ?? realSleep;
   const politeDelayMs = deps.politeDelayMs ?? 1000;
   const targets: FetchTarget[] = [];
@@ -793,10 +874,21 @@ export async function fetchJobs(a: FetchArgs, deps: FetchDeps = {}) {
     const t = targets[i];
     if (i > 0 && politeDelayMs > 0) await sleep(politeDelayMs);
     let board; try { board = await fetchBoardFn(t.platform, t.slug); } catch { board = null; }
-    if (board === null) { unreachable++; per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true }); continue; }
+    if (board === null) {
+      unreachable++;
+      const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, unreachable: true };
+      rememberCheck(entry, { board_type: t.platform, board_key: t.slug, company_id: t.company_id, unreachable: true, seen: 0, updated: 0, new_postings: [], returned_postings: [], closed_postings: [] });
+      per_company.push(entry);
+      continue;
+    }
     const r = DB.upsertJobs(t.company_id, board);
     totals.inserted += r.inserted; totals.updated += r.updated; totals.closed += r.closed;
-    per_company.push({ company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, ...r });
+    const entry: Record<string, unknown> = { company_id: t.company_id, name: t.name, platform: t.platform, slug: t.slug, ...r };
+    rememberCheck(entry, {
+      board_type: t.platform, board_key: t.slug, company_id: t.company_id, seen: r.seen, updated: r.updated,
+      new_postings: r.new_postings, returned_postings: r.returned_postings, closed_postings: r.closed_postings,
+    });
+    per_company.push(entry);
   }
   return json({
     ok: true, boards_fetched: targets.length - unreachable, unreachable, jobs: totals, per_company, catalog: readJourneyState().catalog,
@@ -810,18 +902,18 @@ interface IngestArgs { dry_run?: boolean; github_handle?: string; include_forks?
 interface IngestDeps { fetchReposFn?: typeof fetchUserRepos; enrichFn?: typeof enrichRepo; token?: string }
 
 export async function ingestPortfolio(a: IngestArgs, deps: IngestDeps = {}) {
-  if (a.dry_run !== false) return preview("ingest_portfolio", a);
-  if (!deps.fetchReposFn || !deps.enrichFn) return networkDisabled();
+  if (a.dry_run === true) return preview("ingest_portfolio", a);
+  if (!networkEnabled() && (!deps.fetchReposFn || !deps.enrichFn)) return networkDisabled();
   const s = readJourneyState();
   if (s.profile?.no_github) return json({ ok: false, error: "the user opted out of GitHub (no_github) — coach from the interview + described projects; absence is not penalized." });
   const handle = a.github_handle ?? s.profile?.github_handle ?? undefined;
   if (!handle) return json({ ok: false, error: "no github_handle — pass one, or capture it via capture_profile." });
-  const token = deps.token;
-  const fetchReposFn = deps.fetchReposFn;
+  const token = deps.token !== undefined ? deps.token : (!deps.fetchReposFn && !deps.enrichFn && networkEnabled() ? process.env.GITHUB_TOKEN : undefined);
+  const fetchReposFn = deps.fetchReposFn ?? fetchUserRepos;
   let repos: RepoFacts[];
   try { repos = await fetchReposFn(handle, { token }); } catch (e) { return json({ ok: false, error: `GitHub fetch failed: ${errMsg(e)}` }); }
   const kept = a.include_forks ? repos : repos.filter((r) => !r.is_fork);
-  const enrichFn = deps.enrichFn;
+  const enrichFn = deps.enrichFn ?? enrichRepo;
   const enrichMax = a.enrich_max ?? ENRICH_MAX_DEFAULT;
   const toEnrich = kept.slice(0, enrichMax);
   for (const r of toEnrich) {

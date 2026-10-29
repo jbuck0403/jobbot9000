@@ -40,7 +40,7 @@ export function runJobbot(args: string[], context: JobbotContext): number {
       const result = importResume(context.privateDir, rest[0], rest[2], rest[3] === "--write", context.now);
       context.out(result.imported ? "Resume imported into the private data plane." : "Dry run: no resume read or copied; add --write for explicit import."); return 0;
     }
-    context.error("Usage: jobbot review <batch-rN> | approve-send <batch-rN> --sha256 <digest> | revoke-approval <batch-rN> | import-resume --source <path> --id <opaque-id> [--write]");
+    context.error("Usage: jobbot review <batch-rN> | approve-send <batch-rN> --sha256 <digest> | revoke-approval <batch-rN> | import-resume --source <path> --id <opaque-id> [--write] | boards list|stale|show|stats|add|event|events [--json]");
     return 2;
   } catch (error) {
     if ((error as { code?: string }).code === "operator_boundary_unavailable") context.error("operator_boundary_unavailable: operator-only identity separation is not established; no approval was created.");
@@ -50,6 +50,20 @@ export function runJobbot(args: string[], context: JobbotContext): number {
 }
 export async function main(args = process.argv.slice(2)): Promise<number> {
   const privateDir = resolve(process.env.JOBBOT_PRIVATE_DIR ?? join(process.cwd(), ".private"));
+  if (args[0] === "boards") {
+    process.env.JOBBOT_PRIVATE_DIR = privateDir;
+    process.env.STATE_DIR = join(privateDir, "state");
+    try {
+      const { runBoardCli } = await import("./board-cli.js");
+      return runBoardCli(args.slice(1), {
+        out: (text) => process.stdout.write(text + "\n"),
+        error: (text) => process.stderr.write(text + "\n"),
+      });
+    } catch (error) {
+      process.stderr.write(`${error instanceof Error ? error.message : "board command failed"}\n`);
+      return 1;
+    }
+  }
   let isSuppressed = (_id: string, _destination: string): boolean => { throw new Error("suppression unavailable"); };
   // Only an explicitly selected queue command opens the configured private DB.
   if (["review", "approve-send", "revoke-approval"].includes(args[0])) {

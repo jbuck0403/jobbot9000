@@ -1,4 +1,4 @@
-import { disabledFetch } from "./network.js";
+import { configuredFetch } from "./network.js";
 // github.ts — the GitHub sense behind gather('ingest_portfolio'). Fetches a user's
 // PUBLIC repos and returns structured facts; it never writes the DB and never calls the
 // model. The deep judgment — which project to feature, architecture read, relevance to a
@@ -90,7 +90,7 @@ function toFacts(r: any): RepoFacts | null {
  * returned as-is (flagged) — filtering is the caller's call.
  */
 export async function fetchUserRepos(handle: string, opts: GithubOpts = {}): Promise<RepoFacts[]> {
-  const f = opts.fetchFn ?? disabledFetch;
+  const f = opts.fetchFn ?? configuredFetch;
   const base = opts.baseUrl ?? "https://api.github.com";
   const maxPages = opts.maxPages ?? 3;
   const headers = ghHeaders(opts);
@@ -138,7 +138,7 @@ export async function enrichRepo(
   repo: string,
   opts: GithubOpts & { handle?: string } = {},
 ): Promise<{ languages: string[]; readme_excerpt: string | null; verify?: RepoVerify }> {
-  const f = opts.fetchFn ?? disabledFetch;
+  const f = opts.fetchFn ?? configuredFetch;
   const base = opts.baseUrl ?? "https://api.github.com";
   const headers = ghHeaders(opts);
 

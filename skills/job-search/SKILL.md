@@ -19,7 +19,9 @@ The reachable universe is companies on the four ATSes, so the **free path reache
 Re-runs dedup on domain. Greenhouse / Ashby / Lever are verified; **Workable is best-effort**.
 
 ## Fetch jobs (→ raw, ungraded)
-`gather({ step: 'fetch_jobs' })` — one board (`ats_platform`+`ats_slug` or `company_id`) or all resolved (pass nothing). Idempotent; a liveness pass closes vanished postings; grades survive a refetch.
+`gather({ step: 'fetch_jobs' })` — one board (`ats_platform`+`ats_slug` or `company_id`) or all resolved (pass nothing). Idempotent; a liveness pass closes vanished postings; grades survive a refetch. This is a live HTTPS GET unless `JOBBOT_NETWORK=off`. `dry_run: true` previews and writes nothing. Pass `dry_run: false` only when you mean the same thing as omitting it.
+
+If that company is in the board ledger (`register_board`, or `jobbot boards add`), the fetch appends a check event. Register studios you want a "hours since last check" for; fetching an unregistered slug does not create a ledger row. See `docs/LEDGER.md`. Workday, SmartRecruiters, and browser careers pages can be registered now; only the four ATS fetchers run.
 
 ## Grade + match (your judgment)
 1. `look({ at: 'jobs', scope: 'worklist' })` → the grading queue.
