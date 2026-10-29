@@ -1,6 +1,6 @@
 # jobbot9000
 
-> **Offline foundation (local build):** discovery defaults to a local dry-run preview with zero fetches or catalog mutations. Network adapters have no live default; explicit execution requires injected adapters. No sending/submission capability exists. Use synthetic data only until private transcript retention and per-source terms have been reviewed.
+> **Public ATS fetch is live by default.** `gather` reads Greenhouse, Ashby, Lever, and Workable boards with keyless HTTPS GET. Set `JOBBOT_NETWORK=off` for a hermetic run (the test suite does). `dry_run: true` previews with no requests or writes. TheirStack stays opt-in (`THEIRSTACK_API_KEY`). Nothing is auto-applied and no messages are sent. LinkedIn hosts are refused. The offline discovery loop, people collection, and execution stages still have no live transport.
 
 A local, market-aware **job-search readiness loop** for your AI agent — packaged as a **Claude Code plugin**. One install bundles an MCP server (which reads the real job market and holds your journey) and the skills that drive it. Your agent is the brain; this is its senses and memory. Nothing is hosted, no keys leave your machine, and the whole journey persists locally across sessions that may span months.
 
@@ -51,15 +51,15 @@ Two rules hold everywhere:
 
 **Two data planes:** **Personal** (profile, desires, resume, competency profile, interviews, plan, applications, journal) is **always local, never shared.** **Catalog** (companies + their live jobs — public market data) is local. Nothing leaves the machine.
 
-## The surface — 16 tools
+## The surface — 18 tools
 
 **Three doors:**
 
 - **`orient(detail?)`** — start every session here. Where the user is in the loop, the next best action (`recommended_skill` — the router, priority-ordered over the loop's edges so every state has a way forward), **open threads to resume**, and the recent journal. `detail`: `recommend` (default), `dashboard` (the competency profile, market gap, plan, notes).
-- **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
-- **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards), `ingest_portfolio` (public GitHub repos + verification signals).
+- **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `boards` / `board` / `board_events` (the job-board ledger), `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
+- **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards; records a ledger check when that board is registered), `ingest_portfolio` (public GitHub repos + verification signals). Omit `dry_run` to run; `dry_run: true` previews. `JOBBOT_NETWORK=off` refuses live calls.
 
-**Twelve writes** — five mechanical, seven judgment (each governed by a mode):
+**Fourteen writes** — seven mechanical, seven judgment (each governed by a mode):
 
 | Tool | Plane | Mode |
 |---|---|---|
@@ -67,6 +67,8 @@ Two rules hold everywhere:
 | `set_resume` | personal | `resume_revision` when a rationale is given (a coached revision, journaled); else a wholesale user edit |
 | `add_portfolio_project` | personal | — (a described/private project; added **unverified**) |
 | `record_application` | personal | — (reported status) |
+| `register_board` | ledger | — (company/board registry; no fetch) |
+| `record_board_event` | ledger | — (append-only board event) |
 | `update_plan_progress` | personal | — (suggested → in_progress → done) |
 | `assess_competency` | personal | `competency_profile` (per-dimension; skeptical; absence ≠ low level) |
 | `record_interview` | personal | `interview` (competency or role-fit) |
@@ -107,7 +109,7 @@ claude --plugin-dir /path/to/jobbot9000
 /plugin install jobbot9000@jobbot9000
 ```
 
-Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 16 tools`.
+Verify with `/mcp` — you should see `plugin:jobbot9000:jobbot · connected · 18 tools`.
 
 **Requires Node 22.13+** (24 LTS or newer recommended) — that's where Node's built-in SQLite (`node:sqlite`) is available unflagged.
 
@@ -132,7 +134,9 @@ The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/.priv
 
 **Heads-up when running Claude Code *inside* this repo:** the root `.mcp.json` is auto-discovered as a *project* server but `${CLAUDE_PLUGIN_ROOT}` only expands in *plugin* context, so that project-scoped copy fails harmlessly (`MCP error -32000`). Run `claude --plugin-dir` from **outside** the repo, or disable the project `jobbot` server in `/mcp`. The real plugin shows as `plugin:jobbot9000:jobbot`.
 
-**Discovery env (all optional — discovery is free without any of it):** `find_companies` defaults to the free curated roster + on-demand path; ATS resolution is keyless. `JOBBOT_SEEDS_FILE` points the roster at your own file. Only the opt-in TheirStack accelerator reads `THEIRSTACK_API_KEY` + `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`). `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit (and makes authorship verification more reliable).
+**Discovery env:** `find_companies` defaults to the free curated roster + on-demand path; ATS resolution is keyless and live unless `JOBBOT_NETWORK=off`. `JOBBOT_SEEDS_FILE` points the roster at your own file. Only the opt-in TheirStack accelerator reads `THEIRSTACK_API_KEY` + `THEIRSTACK_MAX_CREDITS_PER_RUN` (default `150`). `ingest_portfolio` reads public GitHub keylessly; `GITHUB_TOKEN`, if set, only raises the rate limit (and makes authorship verification more reliable).
+
+The per-company board ledger is documented in [docs/LEDGER.md](docs/LEDGER.md). It ships empty. `jobbot boards --help` is the shell entry.
 
 ## Layout
 
@@ -142,12 +146,15 @@ The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/.priv
 src/
   index.ts                   stdio entry; registers the tools
   db.ts                      SQLite schema + accessors — the only code that writes the DB (incl. the journal + history)
+  board-ledger.ts            company/board registry + append-only check/application events (empty until you register)
   sqlite.ts                  the SQLite driver — node:sqlite (built into Node), so there is no native dep to rebuild
   state.ts                   the loop state machine (state derived from what data exists)
-  tools.ts                   the 16-tool surface
+  tools.ts                   the 18-tool surface
+  network.ts                 live public fetch, JOBBOT_NETWORK=off, LinkedIn host block
   providers.ts               lead-gen seam — curated (free, default) + TheirStack (opt-in)
   ats.ts                     keyless ATS — slug resolution + board fetch/normalize (Ashby/Greenhouse/Lever/Workable)
   github.ts                  keyless GitHub sense — public repos + verification signals (authorship/traction/badges)
+  board-cli.ts, cli.ts       `jobbot boards` plus the private review commands
 seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / verify / upskill / job-search / application
 modes/                       grading modes (rubric + schema) for the judgment writes

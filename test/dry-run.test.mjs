@@ -9,10 +9,11 @@ const fixture = mkdtempSync(join(tmpdir(), "jobbot-dry-run-"));
 const privateRoot = join(fixture, ".private");
 const stateDir = join(privateRoot, "state");
 mkdirSync(stateDir, { recursive: true });
-const priorEnv = Object.fromEntries(["STATE_DIR", "JOBBOT_PRIVATE_DIR", "JOBBOT_SEEDS_FILE"].map((key) => [key, process.env[key]]));
+const priorEnv = Object.fromEntries(["STATE_DIR", "JOBBOT_PRIVATE_DIR", "JOBBOT_SEEDS_FILE", "JOBBOT_NETWORK"].map((key) => [key, process.env[key]]));
 process.env.STATE_DIR = stateDir;
 process.env.JOBBOT_PRIVATE_DIR = privateRoot;
 process.env.JOBBOT_SEEDS_FILE = join(fixture, "synthetic-seeds.json");
+process.env.JOBBOT_NETWORK = "off";
 writeFileSync(process.env.JOBBOT_SEEDS_FILE, "[]");
 const originalFetch = globalThis.fetch;
 let globalCalls = 0;
@@ -36,7 +37,7 @@ after(() => {
   rmSync(fixture, { recursive: true, force: true });
 });
 
-test("omitted and true dry_run preview every gather path without reading injected credentials or adapters", async () => {
+test("explicit dry_run previews every gather path without reading injected credentials or adapters", async () => {
   const cases = [
     [tools.findCompanies, { companies: [{ name: "Synthetic Co", domain: "example.invalid" }] }],
     [tools.findCompanies, { companies: [{ name: "Synthetic Co", ats_platform: "ashby", ats_slug: "synthetic" }] }],
@@ -48,14 +49,32 @@ test("omitted and true dry_run preview every gather path without reading injecte
   const unreadableDeps = new Proxy({}, { get() { throw new Error("preview accessed adapter/credentials"); } });
   const before = snapshot();
   for (const [fn, args] of cases) {
-    for (const dry of [{}, { dry_run: true }]) {
-      const result = unpack(await fn({ ...args, ...dry }, unreadableDeps));
-      assert.equal(result.ok, true);
-      assert.equal(result.dry_run, true);
-      assert.equal(result.estimate, undefined, "preview must not estimate with a remote adapter");
-      assert.equal(snapshot(), before);
-    }
+    const result = unpack(await fn({ ...args, dry_run: true }, unreadableDeps));
+    assert.equal(result.ok, true);
+    assert.equal(result.dry_run, true);
+    assert.equal(result.estimate, undefined, "preview must not estimate with a remote adapter");
+    assert.equal(snapshot(), before);
   }
+  assert.equal(globalCalls, 0);
+});
+
+test("omitted dry_run executes, and network-off runs fail closed without a global fetch", async () => {
+  const before = snapshot();
+  const blocked = [
+    [tools.findCompanies, { companies: [{ name: "Synthetic Co", domain: "example.invalid" }] }],
+    [tools.findCompanies, { provider: "theirstack" }],
+    [tools.fetchJobs, { ats_platform: "greenhouse", ats_slug: "synthetic-omitted" }],
+    [tools.ingestPortfolio, { github_handle: "synthetic-user" }],
+  ];
+  for (const [fn, args] of blocked) {
+    const result = unpack(await fn(args, {}));
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "network_disabled");
+    assert.equal(snapshot(), before);
+  }
+  const pinned = unpack(await tools.findCompanies({ companies: [{ name: "Synthetic Omitted", ats_platform: "ashby", ats_slug: "synthetic-omitted" }] }));
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.dry_run, undefined);
   assert.equal(globalCalls, 0);
 });
 

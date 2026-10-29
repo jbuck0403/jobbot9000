@@ -1,4 +1,4 @@
-import { disabledFetch } from "./network.js";
+import { configuredFetch } from "./network.js";
 // providers.ts — the lead-gen seam behind gather('find_companies'). Discovery is
 // multi-provider by design (dev handoff §5): a provider turns an applicant query into
 // a list of { name, domain } companies; tools.ts then resolves slugs (ats.ts) and
@@ -136,7 +136,7 @@ function jobsSearchBody(q: DiscoverQuery, limit: number): Record<string, unknown
 }
 
 async function theirstackPost(path: string, body: unknown, ctx: ProviderContext): Promise<any> {
-  const f = ctx.fetchFn ?? disabledFetch;
+  const f = ctx.fetchFn ?? configuredFetch;
   const res = await f(`${ctx.baseUrl ?? THEIRSTACK_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${ctx.apiKey ?? ""}` },

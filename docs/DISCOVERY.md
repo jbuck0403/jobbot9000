@@ -3,7 +3,9 @@
 Stage (a) exposes a bounded library loop for an owner to test with synthetic
 company, career-page and ATS fixtures. It has no installed network transport,
 MCP registration, CLI, people discovery, sender or submission executor. The
-existing MCP gather helpers remain local previews by default. This does not
+separate `gather` door can fetch public Greenhouse, Ashby, Lever, and Workable
+boards unless `JOBBOT_NETWORK=off`. This discovery-loop library still has no
+live transport, and no environment setting enables one here. This does not
 authorize any live discovery or real candidate input.
 
 ## Boundaries
@@ -14,7 +16,8 @@ a fixture adapter, a private checkpoint store, one shared read ledger, source
 policies and optionally a scoring callback. `fixtureOnly: true` describes the
 adapter contract; it cannot prove an arbitrary injected function is harmless.
 Tests use fixture maps and the execution sandbox remains the network boundary.
-No environment setting enables live transport.
+No environment setting enables live transport for this loop. `JOBBOT_NETWORK`
+only affects `gather` (public ATS, opt-in TheirStack, and public GitHub).
 
 A source policy contains an exact host, allowed operations (`discover`,
 `resolve`, `jobs`), a terms reference and checked/expiry timestamps. Policies are

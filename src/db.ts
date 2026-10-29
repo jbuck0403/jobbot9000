@@ -528,6 +528,7 @@ export function recordApplication(
       `${transitioned ? `job ${jobId} → ${next.status}` : `job ${jobId} application updated (${next.status})`}; changes ${JSON.stringify(changes)}`,
       String(jobId),
     );
+    if (transitioned) noteApplicationOnLedger(jobId, cur?.status ?? null, next.status);
     return { changed: true, transitioned, changed_fields };
   })();
 }
@@ -606,7 +607,11 @@ export interface RawJobInput {
   source_url: string; title?: string | null; location?: string | null;
   remote?: number | null; comp_min?: number | null; comp_max?: number | null; raw?: unknown;
 }
-export interface FetchJobsResult { inserted: number; updated: number; closed: number; seen: number }
+export interface PostingChange { job_id: number; source_url: string; title: string | null }
+export interface FetchJobsResult {
+  inserted: number; updated: number; closed: number; seen: number;
+  new_postings: PostingChange[]; returned_postings: PostingChange[]; closed_postings: PostingChange[];
+}
 export function upsertJobs(companyId: number, jobs: RawJobInput[]): FetchJobsResult {
   const tx = db.transaction((): FetchJobsResult => {
     const upsert = db.prepare(
@@ -616,25 +621,40 @@ export function upsertJobs(companyId: number, jobs: RawJobInput[]): FetchJobsRes
          title=excluded.title, location=excluded.location, remote=excluded.remote,
          comp_min=excluded.comp_min, comp_max=excluded.comp_max, raw_json=excluded.raw_json,
          last_seen_at=datetime('now'), still_live=1`);
-    const exists = db.prepare("SELECT 1 FROM jobs WHERE company_id=? AND source_url=?");
+    const priorRows = db.prepare("SELECT id, source_url, title, still_live FROM jobs WHERE company_id=?").all(companyId) as { id: number; source_url: string; title: string | null; still_live: number }[];
+    const prior = new Map(priorRows.map((row) => [row.source_url, row]));
+    const idOf = db.prepare("SELECT id, title FROM jobs WHERE company_id=? AND source_url=?");
     const seen: string[] = [];
+    const seenSet = new Set<string>();
+    const new_postings: PostingChange[] = [];
+    const returned_postings: PostingChange[] = [];
     let inserted = 0, updated = 0;
     for (const j of jobs) {
-      if (!j.source_url) continue;
-      const had = exists.get(companyId, j.source_url);
+      if (!j.source_url || seenSet.has(j.source_url)) continue;
+      seenSet.add(j.source_url);
+      const had = prior.get(j.source_url);
       upsert.run({
         company_id: companyId, source_url: j.source_url, title: j.title ?? null, location: j.location ?? null,
         remote: j.remote ?? null, comp_min: j.comp_min ?? null, comp_max: j.comp_max ?? null,
         raw_json: j.raw != null ? JSON.stringify(j.raw) : null,
       });
-      had ? updated++ : inserted++;
+      const saved = idOf.get(companyId, j.source_url) as { id: number; title: string | null };
+      const change = { job_id: saved.id, source_url: j.source_url, title: saved.title };
+      if (!had) { inserted++; new_postings.push(change); }
+      else {
+        updated++;
+        if (had.still_live === 0) returned_postings.push(change);
+      }
       seen.push(j.source_url);
     }
+    const closed_postings = priorRows
+      .filter((row) => row.still_live === 1 && !seenSet.has(row.source_url))
+      .map((row) => ({ job_id: row.id, source_url: row.source_url, title: row.title }));
     const closed = seen.length === 0
       ? db.prepare("UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1").run(companyId).changes
       : db.prepare(`UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1 AND source_url NOT IN (${seen.map(() => "?").join(",")})`).run(companyId, ...seen).changes;
     db.prepare("UPDATE companies SET last_fetched_at=datetime('now') WHERE id=?").run(companyId);
-    return { inserted, updated, closed, seen: seen.length };
+    return { inserted, updated, closed, seen: seen.length, new_postings, returned_postings, closed_postings };
   });
   return tx();
 }
@@ -1087,4 +1107,32 @@ export function revokePrivateExecutionApproval(approvalId: string, now: number):
     db.prepare("INSERT INTO execution_revocations(approval_id,revoked_at) VALUES (?,?) ON CONFLICT(approval_id) DO NOTHING").run(approvalId, now);
     logEvent("execution_approval_revoked", "private approval revoked", approvalId);
   })();
+}
+
+// Company/board ledger. Schema and writes live in board-ledger.ts; db.ts is still
+// the only module tools and the CLI import to persist state. The personal `events`
+// journal stays the candidate's journey — board checks do not flood it.
+import { createBoardLedger } from "./board-ledger.js";
+const ledgerApi = createBoardLedger(db);
+export const {
+  KNOWN_BOARD_TYPES,
+  BOARD_EVENT_KINDS,
+  registerBoard,
+  appendBoardEvent,
+  listBoardStats,
+  boardStats,
+  staleBoards,
+  recentBoardEvents,
+  recordBoardFetch,
+  hoursSince,
+  nowIso,
+  parseEventTime,
+} = ledgerApi;
+export type {
+  BoardStats, BoardEvent, RegisterBoardInput, RegisterBoardResult, AppendBoardEventInput,
+  BoardFetchInput, BoardFetchRecord, PositionApplied, OpenPosition, LastCheck,
+} from "./board-ledger.js";
+
+function noteApplicationOnLedger(jobId: number, from: string | null, to: string): void {
+  ledgerApi.recordApplicationOnLedger(jobId, from, to);
 }
