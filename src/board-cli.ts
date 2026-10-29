@@ -1,5 +1,6 @@
 // Shell surface for the job-board ledger. Reads and writes go through db.ts.
 // JSON goes to stdout when --json is set, so a non-Claude assistant can script it.
+import { detectBoard } from "./board-id.js";
 import * as DB from "./db.js";
 
 export interface BoardCliIO {
@@ -15,13 +16,15 @@ const USAGE = `Usage:
   jobbot boards add --name <name> --type <type> [--key <slug>] [--domain <host>] [--careers-url <https-url>] [--tags <a,b>] [--notes <text>] [--active|--inactive] [--json]
   jobbot boards event --id <id> --kind <kind> --summary <text> [--job-id <id>] [--payload <json>] [--ts <iso8601>] [--json]
   jobbot boards events [--id <id>] [--limit <n>] [--json]
+  jobbot boards detect <url> [--json]
 
 The ledger starts empty. Register a board before expecting gather to record checks.
-Workday, SmartRecruiters, custom, and browser are valid --type values; only Greenhouse, Ashby, Lever, and Workable are fetched today.`;
+gather fetches greenhouse, ashby, lever, workable, workday (tenant.wdN.site), and smartrecruiters.
+custom and browser are registered and checked by hand.`;
 
 const BOOLEAN = new Set(["json", "active", "inactive"]);
 
-function parseArgs(args: string[]): { command: string; flags: Record<string, string | boolean> } {
+function parseArgs(args: string[]): { command: string; flags: Record<string, string | boolean>; target?: string } {
   const flags: Record<string, string | boolean> = {};
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -35,8 +38,8 @@ function parseArgs(args: string[]): { command: string; flags: Record<string, str
     if (value === undefined || value.startsWith("--")) throw new Error(`--${name} needs a value`);
     flags[name] = value;
   }
-  if (positional.length > 1) throw new Error("unexpected extra arguments");
-  return { command: positional[0] ?? "list", flags };
+  if (positional.length > 2 || (positional.length === 2 && positional[0] !== "detect")) throw new Error("unexpected extra arguments");
+  return { command: positional[0] ?? "list", flags, target: positional[1] };
 }
 function flag(flags: Record<string, string | boolean>, name: string): string | undefined {
   const value = flags[name];
@@ -66,13 +69,24 @@ function requireId(flags: Record<string, string | boolean>): number {
 }
 
 export function runBoardCli(args: string[], io: BoardCliIO): number {
-  let parsed: { command: string; flags: Record<string, string | boolean> };
+  let parsed: { command: string; flags: Record<string, string | boolean>; target?: string };
   try { parsed = parseArgs(args); }
   catch (error) { io.error(error instanceof Error ? error.message : "invalid arguments"); io.error(USAGE); return 2; }
-  const { command, flags } = parsed;
+  const { command, flags, target } = parsed;
   const jsonMode = flags.json === true;
   try {
     if (command === "help" || flags.help === true) { io.out(USAGE); return 0; }
+    if (command === "detect") {
+      const url = target ?? flag(flags, "url");
+      if (!url) throw new Error("pass a careers URL: jobbot boards detect <url>");
+      const detected = detectBoard(url);
+      emit(io, jsonMode, detected, [
+        `${detected.board_type}${detected.board_key ? `\t${detected.board_key}` : ""}`,
+        detected.careers_url,
+        ...(detected.note ? [detected.note] : []),
+      ].join("\n"));
+      return 0;
+    }
     if (command === "list" || command === "stale") {
       const hours = hoursFlag(flags, command === "stale" ? "hours" : "stale-hours");
       if (command === "stale" && hours === undefined) throw new Error("--hours is required");

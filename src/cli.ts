@@ -40,7 +40,7 @@ export function runJobbot(args: string[], context: JobbotContext): number {
       const result = importResume(context.privateDir, rest[0], rest[2], rest[3] === "--write", context.now);
       context.out(result.imported ? "Resume imported into the private data plane." : "Dry run: no resume read or copied; add --write for explicit import."); return 0;
     }
-    context.error("Usage: jobbot review <batch-rN> | approve-send <batch-rN> --sha256 <digest> | revoke-approval <batch-rN> | import-resume --source <path> --id <opaque-id> [--write] | boards list|stale|show|stats|add|event|events [--json]");
+    context.error("Usage: jobbot review <batch-rN> | approve-send <batch-rN> --sha256 <digest> | revoke-approval <batch-rN> | import-resume --source <path> --id <opaque-id> [--write] | boards list|stale|show|stats|add|event|events|detect [--json]");
     return 2;
   } catch (error) {
     if ((error as { code?: string }).code === "operator_boundary_unavailable") context.error("operator_boundary_unavailable: operator-only identity separation is not established; no approval was created.");

@@ -1,3 +1,4 @@
+import { parseSmartRecruiters, parseWorkday, type WorkdayId } from "./board-id.js";
 import { configuredFetch } from "./network.js";
 // ats.ts — free, keyless ATS-slug resolution (Tool 1, stage 4). Given a company's
 // name + domain, find which public ATS board it runs and its slug. Every endpoint is
@@ -18,7 +19,10 @@ import { configuredFetch } from "./network.js";
 //     Workable board is treated as a false positive — resolveAts won't resolve on it (see its
 //     WORKABLE CAVEAT). Workable only counts when it actually returns postings.
 
-export type AtsPlatform = "ashby" | "greenhouse" | "lever" | "workable";
+export const SLUG_ATS_PLATFORMS = ["ashby", "greenhouse", "lever", "workable"] as const;
+export const FETCHABLE_ATS_PLATFORMS = ["ashby", "greenhouse", "lever", "workable", "workday", "smartrecruiters"] as const;
+export type AtsPlatform = (typeof FETCHABLE_ATS_PLATFORMS)[number];
+type SlugPlatform = (typeof SLUG_ATS_PLATFORMS)[number];
 
 export interface AtsResolution {
   platform: AtsPlatform;
@@ -30,7 +34,7 @@ export interface AtsResolution {
 export type FetchFn = typeof fetch;
 
 // Resolution order: Ashby → Greenhouse → Lever → Workable (handoff §5 / tool1_build stage 4).
-const ORDER: AtsPlatform[] = ["ashby", "greenhouse", "lever", "workable"];
+const ORDER: SlugPlatform[] = ["ashby", "greenhouse", "lever", "workable"];
 
 // ── slug candidates ─────────────────────────────────────────────────────────
 // Domain-derived slugs are primary (trusted); name-derived are the fallback and get
@@ -61,7 +65,7 @@ export function slugCandidates(name: string, domain?: string | null): { slug: st
 // One keyless GET per (platform, slug). Shared by resolution (which only needs the
 // count) and fetch_jobs (which needs the normalized postings) so the endpoint knowledge
 // lives in one place.
-const ENDPOINTS: Record<AtsPlatform, (slug: string) => string> = {
+const ENDPOINTS: Record<SlugPlatform, (slug: string) => string> = {
   ashby: (s) => `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(s)}?includeCompensation=true`,
   greenhouse: (s) => `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(s)}/jobs?content=true`,
   lever: (s) => `https://api.lever.co/v0/postings/${encodeURIComponent(s)}?mode=json`,
@@ -99,7 +103,7 @@ function ashbySalary(comp: any): { min: number | null; max: number | null } {
 // platform (wrong shape) — that's a resolution miss. Return [] for a valid EMPTY board.
 // Extraction is tolerant (defensive field reads) since the live shapes can't be pinned
 // in the sandbox; whatever isn't mapped survives in raw_json.
-const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
+const NORMALIZERS: Record<SlugPlatform, (j: any) => RawJob[] | null> = {
   greenhouse: (j) => Array.isArray(j?.jobs)
     ? j.jobs.map((p: any): RawJob => ({ source_url: str(p?.absolute_url) ?? "", title: str(p?.title), location: str(p?.location?.name), remote: /remote/i.test(p?.location?.name ?? "") ? 1 : null, comp_min: null, comp_max: null, raw: p })).filter((x: RawJob) => x.source_url)
     : null,
@@ -118,7 +122,289 @@ const NORMALIZERS: Record<AtsPlatform, (j: any) => RawJob[] | null> = {
 
 // Pure parser shared with the offline discovery adapter. No source reads occur here.
 export function normalizeAtsBoard(platform: AtsPlatform, payload: unknown): RawJob[] | null {
+  if (platform === "workday" || platform === "smartrecruiters") return null;
   return NORMALIZERS[platform](payload);
+}
+
+export class BoardUnreachable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BoardUnreachable";
+  }
+}
+
+export interface FetchBoardOptions {
+  sleep?: (ms: number) => Promise<void>;
+  pageDelayMs?: number;
+  detailDelayMs?: number;
+}
+
+const PAGE_LIMIT = 20;
+const SR_PAGE_LIMIT = 100;
+const MAX_POSTINGS = 5000;
+const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function pacing(fetchFn: FetchFn, opts: FetchBoardOptions): { sleep: (ms: number) => Promise<void>; pageDelayMs: number; detailDelayMs: number } {
+  const live = fetchFn === configuredFetch;
+  return {
+    sleep: opts.sleep ?? realSleep,
+    pageDelayMs: opts.pageDelayMs ?? (live ? 200 : 0),
+    detailDelayMs: opts.detailDelayMs ?? (live ? 100 : 0),
+  };
+}
+
+function netCode(error: unknown): string {
+  const cause = (error as { cause?: { code?: string }; code?: string })?.cause;
+  const code = cause?.code ?? (error as { code?: string })?.code;
+  return typeof code === "string" ? code : "";
+}
+
+function describeNet(error: unknown, host: string): string {
+  const code = netCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  if (code === "ENOTFOUND" || /ENOTFOUND|getaddrinfo/i.test(message))
+    return `host ${host} could not be reached (check the tenant and wd number)`;
+  return message;
+}
+
+function rethrowDisabled(error: unknown): void {
+  if (error instanceof BoardUnreachable) throw error;
+  if (error instanceof Error && /network disabled/i.test(error.message)) throw error;
+}
+
+async function readPayload(res: Response): Promise<{ json: any; text: string }> {
+  const text = typeof res.text === "function" ? await res.text() : "";
+  if (!text) return { json: null, text: "" };
+  try { return { json: JSON.parse(text), text }; }
+  catch { return { json: null, text }; }
+}
+
+function apiMessage(json: any, text: string): string {
+  if (json && typeof json === "object") {
+    const message = typeof json.message === "string" ? json.message.trim() : "";
+    const code = typeof json.errorCode === "string" ? json.errorCode : (typeof json.code === "string" ? json.code : "");
+    if (message) return message.slice(0, 300);
+    if (code) return code;
+  }
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  if (trimmed && !trimmed.startsWith("<")) return trimmed.slice(0, 300);
+  return "";
+}
+
+function remoteFrom(location: string | null, hint: unknown): number | null {
+  if (hint === true) return 1;
+  if (typeof hint === "string" && /remote/i.test(hint)) return 1;
+  if (location && /\bremote\b/i.test(location)) return 1;
+  return null;
+}
+
+function clip(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, 100_000) : null;
+}
+
+async function requestJson(fetchFn: FetchFn, url: string, init: RequestInit | undefined, host: string, label: string): Promise<{ status: number; json: any; text: string }> {
+  let res: Response;
+  try { res = await fetchFn(url, init); }
+  catch (error) {
+    rethrowDisabled(error);
+    throw new BoardUnreachable(`${label}: ${describeNet(error, host)}`);
+  }
+  const payload = await readPayload(res);
+  return { status: res.status, ...payload };
+}
+
+function workdayFailure(status: number, json: any, text: string, id: WorkdayId): string {
+  const detail = apiMessage(json, text);
+  if (status === 404)
+    return `workday site '${id.site}' was not found on ${id.host}${detail ? ` (${detail})` : " (the site may have been renamed)"}`;
+  if (status === 422)
+    return `workday rejected ${id.key} (HTTP 422${detail ? `: ${detail}` : ""}). The wd number is often wrong, or this is not a public career site.`;
+  if (status === 401 || status === 403)
+    return `workday refused ${id.key} (HTTP ${status}${detail ? `: ${detail}` : ""}). This is not a public career site.`;
+  if (status >= 500)
+    return `workday jobs search failed (HTTP ${status}) on ${id.host}${detail ? `: ${detail}` : ""}.`;
+  return `workday jobs search returned HTTP ${status}${detail ? `: ${detail}` : ""} for ${id.key}.`;
+}
+
+async function fetchWorkday(slug: string, fetchFn: FetchFn, opts: FetchBoardOptions): Promise<RawJob[]> {
+  const id = parseWorkday(slug);
+  if (!id) throw new BoardUnreachable("workday board identifier must be tenant.wdN.site or a https://{tenant}.wd{N}.myworkdayjobs.com/{site} URL");
+  const pace = pacing(fetchFn, opts);
+  const jobsUrl = `https://${id.host}/wday/cxs/${encodeURIComponent(id.tenant)}/${encodeURIComponent(id.site)}/jobs`;
+  const collected: { path: string; title: string | null; location: string | null; raw: Record<string, unknown> }[] = [];
+  const seenPaths = new Set<string>();
+  let offset = 0;
+  // The first page reports the real total. Later pages often report total 0 while
+  // still returning postings, and the offset wraps back to the start past the end.
+  let total: number | null = null;
+  let page = 0;
+  while (total === null || offset < total) {
+    if (page > 0 && pace.pageDelayMs > 0) await pace.sleep(pace.pageDelayMs);
+    page++;
+    if (page > Math.ceil(MAX_POSTINGS / PAGE_LIMIT))
+      throw new BoardUnreachable(`workday ${id.key} exceeded ${MAX_POSTINGS} postings; refusing a partial list because the missing jobs would be marked closed`);
+    const response = await requestJson(fetchFn, jobsUrl, {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify({ appliedFacets: {}, limit: PAGE_LIMIT, offset, searchText: "" }),
+    }, id.host, `workday ${id.key}`);
+    if (response.status < 200 || response.status >= 300)
+      throw new BoardUnreachable(workdayFailure(response.status, response.json, response.text, id));
+    const postings = response.json?.jobPostings;
+    const reported = response.json?.total;
+    if (!Array.isArray(postings) || typeof reported !== "number")
+      throw new BoardUnreachable(`workday ${id.key} returned an unexpected jobs payload (HTTP ${response.status})`);
+    if (total === null && reported > 0) total = reported;
+    if (postings.length === 0) break;
+    const before = collected.length;
+    for (const posting of postings) {
+      const path = typeof posting?.externalPath === "string" ? posting.externalPath : "";
+      if (!path.startsWith("/job/") || path.includes("..") || seenPaths.has(path)) continue;
+      seenPaths.add(path);
+      const location = str(posting?.locationsText);
+      collected.push({
+        path,
+        title: str(posting?.title),
+        location,
+        raw: {
+          title: posting?.title ?? null,
+          externalPath: path,
+          locationsText: posting?.locationsText ?? null,
+          postedOn: posting?.postedOn ?? null,
+          bulletFields: posting?.bulletFields ?? null,
+        },
+      });
+    }
+    if (collected.length === before) break;
+    offset += postings.length;
+    if (total !== null && offset >= total) break;
+    if (postings.length < PAGE_LIMIT) break;
+  }
+  const jobs: RawJob[] = [];
+  for (let i = 0; i < collected.length; i++) {
+    const item = collected[i];
+    if (i > 0 && pace.detailDelayMs > 0) await pace.sleep(pace.detailDelayMs);
+    const detailUrl = `https://${id.host}/wday/cxs/${encodeURIComponent(id.tenant)}/${encodeURIComponent(id.site)}${item.path}`;
+    let info: any = null;
+    let detailError: string | null = null;
+    try {
+      const detail = await requestJson(fetchFn, detailUrl, { method: "GET", headers: { accept: "application/json" } }, id.host, `workday ${id.key}`);
+      if (detail.status >= 200 && detail.status < 300 && detail.json?.jobPostingInfo) info = detail.json.jobPostingInfo;
+      else detailError = `detail HTTP ${detail.status}${apiMessage(detail.json, detail.text) ? `: ${apiMessage(detail.json, detail.text)}` : ""}`;
+    } catch (error) {
+      if (error instanceof Error && /network disabled/i.test(error.message)) throw error;
+      detailError = error instanceof Error ? error.message : "detail fetch failed";
+    }
+    const location = str(info?.location) ?? item.location;
+    const description = clip(info?.jobDescription);
+    jobs.push({
+      source_url: `https://${id.host}/${id.site}${item.path}`,
+      title: str(info?.title) ?? item.title,
+      location,
+      remote: remoteFrom(location, info?.remoteType),
+      comp_min: null,
+      comp_max: null,
+      raw: { ...item.raw, ...(description ? { jobDescription: description } : {}), ...(info ? { jobReqId: info.jobReqId ?? null, timeType: info.timeType ?? null, externalUrl: info.externalUrl ?? null, remoteType: info.remoteType ?? null } : {}), ...(detailError ? { detail_error: detailError } : {}) },
+    });
+  }
+  return jobs;
+}
+
+function srFailure(status: number, json: any, text: string, key: string): string {
+  const detail = apiMessage(json, text);
+  if (status === 404) return `smartrecruiters company '${key}' was not found (HTTP 404${detail ? `: ${detail}` : ""}).`;
+  if (status >= 500) return `smartrecruiters company '${key}' failed (HTTP ${status}${detail ? `: ${detail}` : ""}).`;
+  return `smartrecruiters company '${key}' returned HTTP ${status}${detail ? `: ${detail}` : ""}.`;
+}
+
+function srLocation(location: any): { text: string | null; remote: number | null } {
+  if (!location || typeof location !== "object") return { text: null, remote: null };
+  const joined = [location.city, location.region, location.country].filter((part) => typeof part === "string" && part.trim()).join(", ");
+  const text = str(location.fullLocation) ?? (joined || null);
+  return { text, remote: location.remote === true ? 1 : remoteFrom(text, null) };
+}
+
+async function fetchSmartRecruiters(slug: string, fetchFn: FetchFn, opts: FetchBoardOptions): Promise<RawJob[]> {
+  const id = parseSmartRecruiters(slug);
+  if (!id) throw new BoardUnreachable("smartrecruiters board identifier must be the company identifier or a jobs.smartrecruiters.com URL");
+  const pace = pacing(fetchFn, opts);
+  const host = "api.smartrecruiters.com";
+  const listed: { id: string; title: string | null; location: string | null; remote: number | null; raw: Record<string, unknown> }[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  let total = Number.POSITIVE_INFINITY;
+  let page = 0;
+  while (offset < total) {
+    if (page > 0 && pace.pageDelayMs > 0) await pace.sleep(pace.pageDelayMs);
+    page++;
+    if (offset >= MAX_POSTINGS)
+      throw new BoardUnreachable(`smartrecruiters ${id.key} exceeded ${MAX_POSTINGS} postings; refusing a partial list because the missing jobs would be marked closed`);
+    const url = `https://${host}/v1/companies/${encodeURIComponent(id.key)}/postings?limit=${SR_PAGE_LIMIT}&offset=${offset}`;
+    const response = await requestJson(fetchFn, url, { method: "GET", headers: { accept: "application/json" } }, host, `smartrecruiters ${id.key}`);
+    if (response.status < 200 || response.status >= 300)
+      throw new BoardUnreachable(srFailure(response.status, response.json, response.text, id.key));
+    const content = response.json?.content;
+    const reported = response.json?.totalFound;
+    if (!Array.isArray(content) || typeof reported !== "number")
+      throw new BoardUnreachable(`smartrecruiters ${id.key} returned an unexpected postings payload (HTTP ${response.status})`);
+    total = reported;
+    if (content.length === 0) break;
+    for (const posting of content) {
+      const postingId = typeof posting?.id === "string" ? posting.id : "";
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(postingId) || seen.has(postingId)) continue;
+      seen.add(postingId);
+      const place = srLocation(posting?.location);
+      listed.push({
+        id: postingId,
+        title: str(posting?.name),
+        location: place.text,
+        remote: place.remote,
+        raw: {
+          id: postingId,
+          name: posting?.name ?? null,
+          refNumber: posting?.refNumber ?? null,
+          releasedDate: posting?.releasedDate ?? null,
+          location: posting?.location ?? null,
+          department: posting?.department ?? null,
+          typeOfEmployment: posting?.typeOfEmployment ?? null,
+        },
+      });
+    }
+    offset += content.length;
+    if (content.length < SR_PAGE_LIMIT) break;
+  }
+  const jobs: RawJob[] = [];
+  for (let i = 0; i < listed.length; i++) {
+    const item = listed[i];
+    if (i > 0 && pace.detailDelayMs > 0) await pace.sleep(pace.detailDelayMs);
+    const detailUrl = `https://${host}/v1/companies/${encodeURIComponent(id.key)}/postings/${encodeURIComponent(item.id)}`;
+    let detail: any = null;
+    let detailError: string | null = null;
+    try {
+      const response = await requestJson(fetchFn, detailUrl, { method: "GET", headers: { accept: "application/json" } }, host, `smartrecruiters ${id.key}`);
+      if (response.status >= 200 && response.status < 300 && response.json && typeof response.json === "object") detail = response.json;
+      else detailError = `detail HTTP ${response.status}${apiMessage(response.json, response.text) ? `: ${apiMessage(response.json, response.text)}` : ""}`;
+    } catch (error) {
+      if (error instanceof Error && /network disabled/i.test(error.message)) throw error;
+      detailError = error instanceof Error ? error.message : "detail fetch failed";
+    }
+    const sections = detail?.jobAd?.sections;
+    const description = clip([sections?.jobDescription?.text, sections?.qualifications?.text, sections?.additionalInformation?.text]
+      .filter((part) => typeof part === "string" && part.trim()).join("\n\n"));
+    const place = detail ? srLocation(detail.location) : { text: item.location, remote: item.remote };
+    jobs.push({
+      source_url: `https://jobs.smartrecruiters.com/${id.key}/${item.id}`,
+      title: str(detail?.name) ?? item.title,
+      location: place.text ?? item.location,
+      remote: place.remote ?? item.remote,
+      comp_min: null,
+      comp_max: null,
+      raw: { ...item.raw, ...(description ? { jobDescription: description } : {}), ...(detail?.postingUrl ? { postingUrl: detail.postingUrl } : {}), ...(detailError ? { detail_error: detailError } : {}) },
+    });
+  }
+  return jobs;
 }
 
 /**
@@ -127,7 +413,9 @@ export function normalizeAtsBoard(platform: AtsPlatform, payload: unknown): RawJ
  * error, garbage payload). The null-vs-[] distinction matters for liveness: [] means
  * "valid board, nothing open" (close everything), null means "couldn't reach" (leave as-is).
  */
-export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: FetchFn = configuredFetch): Promise<RawJob[] | null> {
+export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: FetchFn = configuredFetch, opts: FetchBoardOptions = {}): Promise<RawJob[] | null> {
+  if (platform === "workday") return fetchWorkday(slug, fetchFn, opts);
+  if (platform === "smartrecruiters") return fetchSmartRecruiters(slug, fetchFn, opts);
   let res: Response;
   try { res = await fetchFn(ENDPOINTS[platform](slug)); } catch { return null; }
   if (!res.ok) return null;
@@ -138,7 +426,7 @@ export async function fetchBoard(platform: AtsPlatform, slug: string, fetchFn: F
 
 export interface ResolveOpts {
   fetchFn?: FetchFn;
-  order?: AtsPlatform[]; // override probe order (tests / tuning)
+  order?: SlugPlatform[]; // override probe order (tests / tuning)
 }
 
 /**

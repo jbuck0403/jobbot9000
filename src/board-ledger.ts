@@ -1,7 +1,7 @@
 // Per-company job-board ledger. Append-only events, mutable registry.
-// Ships empty: nothing in here inserts a company. Later ATS adapters (Workday,
-// SmartRecruiters) and browser checks reuse the same board_type + event kinds.
-// Only db.ts imports this module.
+// Ships empty: nothing in here inserts a company. Browser checks reuse the same
+// board_type + event kinds. Only db.ts imports this module.
+import { registrationIdentity } from "./board-id.js";
 import { linkedInHost } from "./network.js";
 
 interface SqlStatement {
@@ -409,15 +409,22 @@ END;
   function registerBoard(input: RegisterBoardInput): RegisterBoardResult {
     const name = cleanName(input.name);
     const board_type = cleanType(input.board_type);
-    const board_key = input.board_key === undefined ? null : cleanKey(input.board_key);
+    const identity = registrationIdentity(board_type, input.board_key, input.careers_url);
+    const lookupKey = identity ? identity.key : (input.board_key === undefined ? null : cleanKey(input.board_key));
+    const nextKey = identity ? identity.key : (input.board_key === undefined ? undefined : cleanKey(input.board_key));
+    const nextUrl = identity ? cleanCareersUrl(identity.careers_url) : (input.careers_url === undefined ? undefined : cleanCareersUrl(input.careers_url));
     return db.transaction((): RegisterBoardResult => {
-      const existing = findBoard(board_type, board_key, name);
+      const existing = findBoard(board_type, lookupKey, name);
       const stamp = nowIso();
       if (!existing) {
-        const key = board_key;
+        if ((board_type === "workday" || board_type === "smartrecruiters") && !nextKey)
+          throw new Error(board_type === "workday"
+            ? "workday boards need board_key tenant.wdN.site or a myworkdayjobs.com careers URL"
+            : "smartrecruiters boards need a company identifier or a jobs.smartrecruiters.com URL");
+        const key = nextKey === undefined ? null : nextKey;
         const tags = serializeTags(validateTags(input.tags ?? []));
         const domain = normalizeDomain(input.domain);
-        const careers_url = cleanCareersUrl(input.careers_url);
+        const careers_url = nextUrl === undefined ? null : nextUrl;
         const notes = cleanNotes(input.notes);
         const active = input.active === false ? 0 : 1;
         const company_id = key ? catalogCompanyId(board_type, key) : null;
@@ -436,7 +443,7 @@ END;
         });
         return { id, inserted: true };
       }
-      const key = input.board_key === undefined ? existing.board_key : cleanKey(input.board_key);
+      const key = nextKey === undefined ? existing.board_key : nextKey;
       if (key && key !== existing.board_key) {
         const owner = db.prepare("SELECT id FROM board_registry WHERE board_type=? AND board_key=? AND id<>?").get(board_type, key, existing.id) as { id: number } | undefined;
         if (owner) throw new Error(`board ${board_type}/${key} is already registered`);
@@ -449,7 +456,7 @@ END;
         else if (keyChanged) company_id = null;
       }
       const domain = input.domain === undefined ? existing.domain : normalizeDomain(input.domain);
-      const careers_url = input.careers_url === undefined ? existing.careers_url : cleanCareersUrl(input.careers_url);
+      const careers_url = nextUrl === undefined ? existing.careers_url : nextUrl;
       const tags = input.tags === undefined ? existing.tags : serializeTags(validateTags(input.tags));
       const notes = input.notes === undefined ? existing.notes : cleanNotes(input.notes);
       const active = input.active === undefined ? existing.active : (input.active ? 1 : 0);
