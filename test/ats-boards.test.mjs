@@ -63,7 +63,7 @@ describe("workday and smartrecruiters", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("detector and registration identifiers", () => {
+  test("detector and registration identifiers", async () => {
     assert.deepEqual(ids.detectBoard("https://nature.wd108.myworkdayjobs.com/en-US/ExternalCareers/job/Remote/Role_JR1"), {
       board_type: "workday", board_key: "nature.wd108.externalcareers",
       careers_url: "https://nature.wd108.myworkdayjobs.com/ExternalCareers",
@@ -98,7 +98,7 @@ describe("workday and smartrecruiters", () => {
     assert.throws(() => DB.registerBoard({ name: "No Key", board_type: "smartrecruiters" }), /company identifier/);
 
     const out = [];
-    const code = runBoardCli(["detect", "https://boards.greenhouse.io/riotgames", "--json"], { out: (line) => out.push(line), error: () => {} });
+    const code = await runBoardCli(["detect", "https://boards.greenhouse.io/riotgames", "--json"], { out: (line) => out.push(line), error: () => {} });
     assert.equal(code, 0);
     assert.equal(JSON.parse(out.join("\n")).board_key, "riotgames");
     assert.equal(globalCalls, 0);
@@ -125,7 +125,7 @@ describe("workday and smartrecruiters", () => {
     });
     let slept = 0;
     const jobs = await ats.fetchBoard("workday", "nature.wd108.externalcareers", fetchFn, {
-      sleep: async () => { slept++; }, pageDelayMs: 5, detailDelayMs: 5,
+      sleep: async () => { slept++; }, pageDelayMs: 5, detailDelayMs: 5, details: "all",
     });
     assert.equal(jobs.length, 41);
     assert.equal(calls.filter((call) => call.url.endsWith("/jobs")).length, 3);
@@ -207,7 +207,7 @@ describe("workday and smartrecruiters", () => {
         jobAd: { sections: { jobDescription: { text: `<p>Desc ${id}</p>` }, qualifications: { text: "<p>Bar</p>" } } },
       });
     });
-    const jobs = await ats.fetchBoard("smartrecruiters", "https://jobs.smartrecruiters.com/SmartRecruiters", fetchFn);
+    const jobs = await ats.fetchBoard("smartrecruiters", "https://jobs.smartrecruiters.com/SmartRecruiters", fetchFn, { details: "all" });
     assert.equal(jobs.length, 101);
     assert.equal(calls.filter((call) => call.url.includes("/postings?")).length, 2);
     assert.equal(jobs[0].source_url, "https://jobs.smartrecruiters.com/smartrecruiters/p0");

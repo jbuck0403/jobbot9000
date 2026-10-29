@@ -57,7 +57,7 @@ Two rules hold everywhere:
 
 - **`orient(detail?)`** — start every session here. Where the user is in the loop, the next best action (`recommended_skill` — the router, priority-ordered over the loop's edges so every state has a way forward), **open threads to resume**, and the recent journal. `detail`: `recommend` (default), `dashboard` (the competency profile, market gap, plan, notes).
 - **`look(at, …)`** — the one read door; never fetches, never writes. `at`: `jobs` (`market`/`relevant`/`worklist`), `companies`, `boards` / `board` / `board_events` (the job-board ledger), `resume`, `portfolio`, `profile`, `competency`, `interview`, `plan`, `packet`, `applications`, `history`.
-- **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull live ATS boards, including Workday `tenant.wdN.site` and SmartRecruiters company identifiers; records a ledger check when that board is registered), `ingest_portfolio` (public GitHub repos + verification signals). Omit `dry_run` to run; `dry_run: true` previews. `JOBBOT_NETWORK=off` refuses live calls.
+- **`gather(step, …)`** — the one fetch door. `step`: `find_companies` (discover → resolve ATS slugs; free by default, TheirStack opt-in), `fetch_jobs` (pull a bounded batch of live ATS boards, including Workday `tenant.wdN.site` and SmartRecruiters company identifiers; list fields by default; `cursor` resumes; records a ledger check when that board is registered), `ingest_portfolio` (public GitHub repos + verification signals). Omit `dry_run` to run; `dry_run: true` previews. `JOBBOT_NETWORK=off` refuses live calls. A long board pass is `jobbot boards check`, not this tool.
 - **`detect_board(url)`** — read-only. Given a careers URL, returns the ATS and board identifier (`greenhouse`, `ashby`, `lever`, `workable`, `workday`, `smartrecruiters`), or `custom` when none match. Does not fetch or register. The shell form is `jobbot boards detect <url> --json`.
 
 **Fourteen writes** — seven mechanical, seven judgment (each governed by a mode):
@@ -131,7 +131,7 @@ npm test           # offline test suite (tsx against src/, mocked HTTP — no ne
                    #   test/discovery.test.mjs — ATS/providers/gather + the loop
 ```
 
-The server reads `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/.private/state`) and opens `jobbot.db` there; unset, it falls back to `~/.jobbot/.private/state`.
+The server and `jobbot boards` read the same state. `STATE_DIR` (the plugin sets it to `${CLAUDE_PLUGIN_DATA}/.private/state`) or `JOBBOT_PRIVATE_DIR` selects it; unset, both fall back to `~/.jobbot/.private/state`. `jobbot boards --state-dir` is an absolute path inside `.private` for one run. Fetch timeouts and the posting cap are `JOBBOT_FETCH_TIMEOUT_MS` (20s), `JOBBOT_FETCH_RETRIES` (2), `JOBBOT_FETCH_BACKOFF_MS` (200), and `JOBBOT_MAX_POSTINGS` (500).
 
 **Heads-up when running Claude Code *inside* this repo:** the root `.mcp.json` is auto-discovered as a *project* server but `${CLAUDE_PLUGIN_ROOT}` only expands in *plugin* context, so that project-scoped copy fails harmlessly (`MCP error -32000`). Run `claude --plugin-dir` from **outside** the repo, or disable the project `jobbot` server in `/mcp`. The real plugin shows as `plugin:jobbot9000:jobbot`.
 
@@ -156,7 +156,7 @@ src/
   ats.ts                     keyless ATS — slug resolution + board fetch (Ashby/Greenhouse/Lever/Workable/Workday/SmartRecruiters)
   board-id.ts                careers-URL detector and Workday/SmartRecruiters identifier parsing
   github.ts                  keyless GitHub sense — public repos + verification signals (authorship/traction/badges)
-  board-cli.ts, cli.ts       `jobbot boards` plus the private review commands
+  board-cli.ts, board-check.ts, cli.ts   `jobbot boards` (check, import, apply, manual check) plus the private review commands
 seeds/                       curated company roster (free default for find_companies); ships empty
 skills/                      bundled skills: coach / verify / upskill / job-search / application
 modes/                       grading modes (rubric + schema) for the judgment writes

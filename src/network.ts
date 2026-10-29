@@ -44,25 +44,105 @@ function asUrl(input: Parameters<typeof fetch>[0]): URL {
 
 const MAX_REDIRECTS = 3;
 
+export function fetchTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.JOBBOT_FETCH_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return 20_000;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1) throw new Error("JOBBOT_FETCH_TIMEOUT_MS must be a positive number of milliseconds");
+  return value;
+}
+export function fetchRetryCount(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.JOBBOT_FETCH_RETRIES;
+  if (raw === undefined || raw.trim() === "") return 2;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > 5) throw new Error("JOBBOT_FETCH_RETRIES must be an integer from 0 to 5");
+  return value;
+}
+function fetchBackoffMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.JOBBOT_FETCH_BACKOFF_MS;
+  if (raw === undefined || raw.trim() === "") return 200;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) throw new Error("JOBBOT_FETCH_BACKOFF_MS must be a non-negative number");
+  return value;
+}
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function armTimeout(ms: number): { signal: AbortSignal; disarm: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    const error = new Error("The operation was aborted due to timeout");
+    error.name = "TimeoutError";
+    controller.abort(error);
+  }, ms);
+  return { signal: controller.signal, disarm: () => clearTimeout(timer) };
+}
+function timedInit(init: RequestInit | undefined, ms: number): { init: RequestInit; disarm: () => void } {
+  const armed = armTimeout(ms);
+  const signal = init?.signal ? AbortSignal.any([init.signal, armed.signal]) : armed.signal;
+  return { init: { ...init, signal }, disarm: armed.disarm };
+}
+function isTimeout(error: unknown): boolean {
+  const name = (error as { name?: string })?.name;
+  const message = error instanceof Error ? error.message : String(error);
+  return name === "TimeoutError" || name === "AbortError" || /timed out|timeout/i.test(message);
+}
+function retryableFailure(error: unknown): boolean {
+  if (isTimeout(error)) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  if (/blocked host|redirect refused|only credential-free/i.test(message)) return false;
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket/i.test(message);
+}
+
 // Follow a few GET redirects ourselves so a hop to LinkedIn is refused.
 // Non-GET redirects are refused so a paid POST (TheirStack) cannot be replayed
 // at an unexpected host with its Authorization header.
-export const liveFetch: typeof fetch = async (input, init) => {
+async function liveFetchOnce(input: Parameters<typeof fetch>[0], init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
   let current = asUrl(input);
   let method = (init?.method ?? "GET").toUpperCase();
-  let nextInit: RequestInit | undefined = init;
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    assertPublicFetchUrl(current);
-    const res = await fetch(current, { ...nextInit, redirect: "manual" });
-    if (res.status < 300 || res.status >= 400) return res;
-    const location = res.headers.get("location");
-    if (!location || hop === MAX_REDIRECTS) throw new Error("redirect refused");
-    if (method !== "GET" && method !== "HEAD") throw new Error("redirect refused for non-GET fetch");
-    current = new URL(location, current);
-    method = "GET";
-    nextInit = { ...nextInit, method: "GET", body: undefined };
-  }
+  let armed = timedInit(init, timeoutMs);
+  try {
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      assertPublicFetchUrl(current);
+      let res: Response;
+      try { res = await fetch(current, { ...armed.init, redirect: "manual" }); }
+      catch (error) {
+        if (isTimeout(error)) throw new Error(`fetch timed out after ${timeoutMs}ms`);
+        throw error;
+      } finally { armed.disarm(); }
+      if (res.status < 300 || res.status >= 400) return res;
+      const location = res.headers.get("location");
+      if (!location || hop === MAX_REDIRECTS) throw new Error("redirect refused");
+      if (method !== "GET" && method !== "HEAD") throw new Error("redirect refused for non-GET fetch");
+      current = new URL(location, current);
+      method = "GET";
+      armed = timedInit({ ...armed.init, method: "GET", body: undefined }, timeoutMs);
+    }
+  } finally { armed.disarm(); }
   throw new Error("redirect refused");
+}
+
+export const liveFetch: typeof fetch = async (input, init) => {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const retries = fetchRetryCount();
+  const timeoutMs = fetchTimeoutMs();
+  const backoff = fetchBackoffMs();
+  let last: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await liveFetchOnce(input, init, timeoutMs);
+      const retryStatus = method === "GET" || method === "HEAD" ? (res.status === 429 || res.status >= 500) : false;
+      if (retryStatus && attempt < retries) {
+        await pause(backoff * (2 ** attempt));
+        continue;
+      }
+      return res;
+    } catch (error) {
+      last = error;
+      if (!retryableFailure(error) || attempt === retries) throw error;
+      await pause(backoff * (2 ** attempt));
+    }
+  }
+  throw last instanceof Error ? last : new Error("fetch failed");
 };
 
 export const disabledFetch: typeof fetch = async () => {

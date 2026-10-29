@@ -40,7 +40,7 @@ export function runJobbot(args: string[], context: JobbotContext): number {
       const result = importResume(context.privateDir, rest[0], rest[2], rest[3] === "--write", context.now);
       context.out(result.imported ? "Resume imported into the private data plane." : "Dry run: no resume read or copied; add --write for explicit import."); return 0;
     }
-    context.error("Usage: jobbot review <batch-rN> | approve-send <batch-rN> --sha256 <digest> | revoke-approval <batch-rN> | import-resume --source <path> --id <opaque-id> [--write] | boards list|stale|show|stats|add|event|events|detect [--json]");
+    context.error("Usage: jobbot review <batch-rN> | approve-send <batch-rN> --sha256 <digest> | revoke-approval <batch-rN> | import-resume --source <path> --id <opaque-id> [--write] | boards list|stale|show|stats|add|update|import|check|apply|record-manual-check|event|events|detect [--json]");
     return 2;
   } catch (error) {
     if ((error as { code?: string }).code === "operator_boundary_unavailable") context.error("operator_boundary_unavailable: operator-only identity separation is not established; no approval was created.");
@@ -48,14 +48,39 @@ export function runJobbot(args: string[], context: JobbotContext): number {
     return 1;
   }
 }
+export function takeOption(args: string[], name: string): { args: string[]; value?: string } {
+  const out: string[] = [];
+  let value: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === `--${name}`) {
+      const next = args[++i];
+      if (next === undefined) throw new Error(`--${name} needs a value`);
+      value = next;
+      continue;
+    }
+    out.push(args[i]);
+  }
+  return { args: out, value };
+}
+
+// Boards and the MCP server share prepareStorage. An explicit --state-dir or
+// an already-set STATE_DIR / JOBBOT_PRIVATE_DIR wins. Otherwise both default
+// to ~/.jobbot/.private/state. Review commands still pin the cwd .private tree.
+export function boardsEnv(args: string[], env: NodeJS.ProcessEnv = process.env): { args: string[]; stateDir?: string } {
+  const taken = takeOption(args, "state-dir");
+  if (taken.value !== undefined) return { args: taken.args, stateDir: resolve(taken.value) };
+  if (env.STATE_DIR || env.JOBBOT_PRIVATE_DIR) return { args: taken.args };
+  return { args: taken.args };
+}
+
 export async function main(args = process.argv.slice(2)): Promise<number> {
   const privateDir = resolve(process.env.JOBBOT_PRIVATE_DIR ?? join(process.cwd(), ".private"));
   if (args[0] === "boards") {
-    process.env.JOBBOT_PRIVATE_DIR = privateDir;
-    process.env.STATE_DIR = join(privateDir, "state");
     try {
+      const selected = boardsEnv(args.slice(1));
+      if (selected.stateDir) process.env.STATE_DIR = selected.stateDir;
       const { runBoardCli } = await import("./board-cli.js");
-      return runBoardCli(args.slice(1), {
+      return await runBoardCli(selected.args, {
         out: (text) => process.stdout.write(text + "\n"),
         error: (text) => process.stderr.write(text + "\n"),
       });

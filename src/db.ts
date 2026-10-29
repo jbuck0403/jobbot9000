@@ -5,6 +5,7 @@
 // state is multi-dimensional and DURABLE — versioned history + an append-only journal so a
 // search that spans months never loses progress and any new session resumes from the DB.
 import Database from "./sqlite.js";
+import { linkedInHost } from "./network.js";
 import { prepareStorage } from "./storage.js";
 import { resolveInterviewRequest, type InterviewRequest, type InterviewError } from "./interview.js";
 
@@ -612,7 +613,8 @@ export interface FetchJobsResult {
   inserted: number; updated: number; closed: number; seen: number;
   new_postings: PostingChange[]; returned_postings: PostingChange[]; closed_postings: PostingChange[];
 }
-export function upsertJobs(companyId: number, jobs: RawJobInput[]): FetchJobsResult {
+export function upsertJobs(companyId: number, jobs: RawJobInput[], opts: { closeMissing?: boolean } = {}): FetchJobsResult {
+  const closeMissing = opts.closeMissing !== false;
   const tx = db.transaction((): FetchJobsResult => {
     const upsert = db.prepare(
       `INSERT INTO jobs (company_id, source_url, title, location, remote, comp_min, comp_max, raw_json, fetched_at, last_seen_at, still_live)
@@ -647,12 +649,16 @@ export function upsertJobs(companyId: number, jobs: RawJobInput[]): FetchJobsRes
       }
       seen.push(j.source_url);
     }
-    const closed_postings = priorRows
-      .filter((row) => row.still_live === 1 && !seenSet.has(row.source_url))
-      .map((row) => ({ job_id: row.id, source_url: row.source_url, title: row.title }));
-    const closed = seen.length === 0
-      ? db.prepare("UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1").run(companyId).changes
-      : db.prepare(`UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1 AND source_url NOT IN (${seen.map(() => "?").join(",")})`).run(companyId, ...seen).changes;
+    const closed_postings = closeMissing
+      ? priorRows
+        .filter((row) => row.still_live === 1 && !seenSet.has(row.source_url))
+        .map((row) => ({ job_id: row.id, source_url: row.source_url, title: row.title }))
+      : [];
+    const closed = !closeMissing
+      ? 0
+      : seen.length === 0
+        ? db.prepare("UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1").run(companyId).changes
+        : db.prepare(`UPDATE jobs SET still_live=0 WHERE company_id=? AND still_live=1 AND source_url NOT IN (${seen.map(() => "?").join(",")})`).run(companyId, ...seen).changes;
     db.prepare("UPDATE companies SET last_fetched_at=datetime('now') WHERE id=?").run(companyId);
     return { inserted, updated, closed, seen: seen.length, new_postings, returned_postings, closed_postings };
   });
@@ -674,6 +680,20 @@ export const getResolvedCompanies = (limit = 200): Company[] =>
   db.prepare(
     `SELECT ${COMPANY_COLS} FROM companies WHERE resolved=1 AND ats_platform IS NOT NULL AND ats_slug IS NOT NULL ORDER BY last_fetched_at ASC, added_at ASC LIMIT ?`,
   ).all(limit) as Company[];
+export function getResolvedCompaniesPage(afterId = 0, limit = 5): { companies: Company[]; next_cursor: number | null } {
+  const rows = db.prepare(
+    `SELECT ${COMPANY_COLS} FROM companies
+     WHERE resolved=1 AND ats_platform IS NOT NULL AND ats_slug IS NOT NULL AND id > ?
+     ORDER BY id ASC LIMIT ?`,
+  ).all(afterId, limit + 1) as Company[];
+  const more = rows.length > limit;
+  const companies = more ? rows.slice(0, limit) : rows;
+  return { companies, next_cursor: more && companies.length ? companies[companies.length - 1].id : null };
+}
+export function jobSourceUrls(companyId: number): string[] {
+  return (db.prepare("SELECT source_url FROM jobs WHERE company_id=? AND still_live=1").all(companyId) as { source_url: string }[])
+    .map((row) => row.source_url);
+}
 
 const normalizeDomain = (d?: string | null): string | null => {
   if (!d) return null;
@@ -1118,12 +1138,14 @@ export const {
   KNOWN_BOARD_TYPES,
   BOARD_EVENT_KINDS,
   registerBoard,
+  updateBoard,
   appendBoardEvent,
   listBoardStats,
   boardStats,
   staleBoards,
   recentBoardEvents,
   recordBoardFetch,
+  recordManualCheck,
   hoursSince,
   nowIso,
   parseEventTime,
@@ -1131,8 +1153,47 @@ export const {
 export type {
   BoardStats, BoardEvent, RegisterBoardInput, RegisterBoardResult, AppendBoardEventInput,
   BoardFetchInput, BoardFetchRecord, PositionApplied, OpenPosition, LastCheck,
+  UpdateBoardInput, ManualCheckInput, BoardListOptions,
 } from "./board-ledger.js";
 
 function noteApplicationOnLedger(jobId: number, from: string | null, to: string): void {
   ledgerApi.recordApplicationOnLedger(jobId, from, to);
+}
+
+const FETCHABLE_BOARD = new Set(["ashby", "greenhouse", "lever", "workable", "workday", "smartrecruiters"]);
+
+export function applyOnBoard(input: { board_id: number; title: string; url?: string | null; posting_id?: string | null; note?: string | null }): { board_id: number; job_id: number; company_id: number } {
+  const board = boardStats(input.board_id);
+  if (!board) throw new Error(`no board ${input.board_id}`);
+  if (typeof input.title !== "string" || !input.title.trim() || input.title.trim().length > 300) throw new Error("title must be 1–300 characters");
+  const title = input.title.trim();
+  let companyId = board.company_id;
+  if (companyId == null) {
+    const platform = FETCHABLE_BOARD.has(board.board_type) ? board.board_type : null;
+    const slug = platform && board.board_key ? board.board_key : null;
+    companyId = upsertCompany({
+      name: board.name, domain: board.domain, source: "ledger", tags: board.tags,
+      ats_platform: platform, ats_slug: slug, resolved: !!(platform && slug),
+    }).id;
+    db.prepare("UPDATE board_registry SET company_id=?, updated_at=? WHERE id=? AND company_id IS NULL").run(companyId, nowIso(), board.id);
+  }
+  let source_url = typeof input.url === "string" ? input.url.trim() : "";
+  if (source_url) {
+    let parsed: URL;
+    try { parsed = new URL(source_url); } catch { throw new Error("url must be an https URL"); }
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error("url must be an https URL without credentials");
+    if (linkedInHost(parsed.hostname)) throw new Error("url cannot be a LinkedIn host");
+    source_url = parsed.toString();
+  } else {
+    const raw = (input.posting_id?.trim() || title).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80);
+    source_url = `manual://board/${board.id}/${raw || "role"}`;
+  }
+  const existing = db.prepare("SELECT id FROM jobs WHERE company_id=? AND source_url=?").get(companyId, source_url) as { id: number } | undefined;
+  const jobId = existing?.id ?? Number(db.prepare(
+    `INSERT INTO jobs (company_id, source_url, title, fetched_at, last_seen_at, still_live)
+     VALUES (?, ?, ?, datetime('now'), datetime('now'), 1)`,
+  ).run(companyId, source_url, title).lastInsertRowid);
+  if (existing) db.prepare("UPDATE jobs SET title=?, still_live=1, last_seen_at=datetime('now') WHERE id=?").run(title, jobId);
+  recordApplication(jobId, { status: "applied", notes: input.note ?? null });
+  return { board_id: board.id, job_id: jobId, company_id: companyId };
 }

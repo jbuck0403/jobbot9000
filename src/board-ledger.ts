@@ -72,6 +72,8 @@ export interface LastCheck {
   new_postings: number | null;
   closed_postings: number | null;
   error: string | null;
+  truncated: boolean;
+  http_status: number | null;
   new_positions: OpenPosition[];
   closed_positions: OpenPosition[];
 }
@@ -88,14 +90,27 @@ export interface BoardStats {
   company_id: number | null;
   created_at: string;
   updated_at: string;
+  /** Last successful check. A failure does not move this clock. */
   last_checked_at: string | null;
+  last_attempt_at: string | null;
+  last_success_at: string | null;
   hours_since_last_check: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
   total_checks: number;
   open_postings_seen: number;
   open_positions: OpenPosition[];
   applications_submitted: number;
   positions_applied_to: PositionApplied[];
   last_check: LastCheck | null;
+}
+export type BoardDetail = boolean | "applications";
+export interface BoardListOptions {
+  tag?: string;
+  limit?: number;
+  offset?: number;
+  /** false omits position arrays. "applications" keeps positions applied to. */
+  detail?: BoardDetail;
 }
 export interface BoardFetchInput {
   board_type: string;
@@ -108,6 +123,23 @@ export interface BoardFetchInput {
   new_postings: { job_id: number; source_url: string; title: string | null }[];
   returned_postings: { job_id: number; source_url: string; title: string | null }[];
   closed_postings: { job_id: number; source_url: string; title: string | null }[];
+  truncated?: boolean;
+  http_status?: number | null;
+}
+export interface UpdateBoardInput {
+  id: number;
+  name?: string;
+  tags?: string[];
+  notes?: string | null;
+  active?: boolean;
+  domain?: string | null;
+  careers_url?: string | null;
+}
+export interface ManualCheckInput {
+  board_id: number;
+  postings: number;
+  note?: string | null;
+  ts?: string;
 }
 export interface BoardFetchRecord { recorded: boolean; board_id?: number; event_id?: number }
 
@@ -168,11 +200,15 @@ function cleanType(type: string): string {
     throw new Error("board_type must be a short slug such as greenhouse, workday, smartrecruiters, custom, or browser");
   return slug;
 }
-function cleanKey(key: string | null | undefined): string | null {
+function cleanKey(key: string | null | undefined, boardType?: string): string | null {
   if (key == null || key === "") return null;
   if (typeof key !== "string") throw new Error("board_key must be a slug");
-  const slug = key.trim().toLowerCase();
-  if (!/^[a-z0-9][a-z0-9._-]{0,120}$/.test(slug)) throw new Error("board_key must be a slug (letters, numbers, '.', '_' or '-')");
+  // Lever's public slug is case-sensitive. Other ATSes accept any case, so
+  // those keys stay lowercase and a re-import cannot fork a second row.
+  const preserve = boardType === "lever";
+  const slug = preserve ? key.trim() : key.trim().toLowerCase();
+  const pattern = preserve ? /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/ : /^[a-z0-9][a-z0-9._-]{0,120}$/;
+  if (!pattern.test(slug)) throw new Error("board_key must be a slug (letters, numbers, '.', '_' or '-')");
   return slug;
 }
 function normalizeDomain(domain?: string | null): string | null {
@@ -244,11 +280,29 @@ function positionFrom(payload: Record<string, unknown>): OpenPosition | null {
   if (!source_url) return null;
   return { job_id: asNumber(payload.job_id), title: asString(payload.title), source_url };
 }
+function checkFailed(payload: Record<string, unknown>): boolean {
+  return typeof payload.error === "string" && payload.error.trim().length > 0;
+}
+function parseJsonArray<T>(json: string | null | undefined): T[] {
+  if (!json) return [];
+  try {
+    const value = JSON.parse(json) as unknown;
+    return Array.isArray(value) ? value as T[] : [];
+  } catch { return []; }
+}
 
 function toStats(row: BoardStored, events: EventStored[], now: Date): BoardStats {
   const checks = events.filter((event) => event.kind === "board_checked");
   const last = checks.length ? checks[checks.length - 1] : undefined;
   const lastPayload = last ? payloadOf(last.payload_json) : {};
+  const successes = checks.filter((event) => !checkFailed(payloadOf(event.payload_json)));
+  const lastSuccess = successes.length ? successes[successes.length - 1] : undefined;
+  const successPayload = lastSuccess ? payloadOf(lastSuccess.payload_json) : {};
+  let consecutive_failures = 0;
+  for (let i = checks.length - 1; i >= 0; i--) {
+    if (!checkFailed(payloadOf(checks[i].payload_json))) break;
+    consecutive_failures++;
+  }
   const posting = events.filter((event) => event.kind === "posting_seen" || event.kind === "posting_gone" || event.kind === "posting_returned");
   const open = new Map<string, OpenPosition>();
   for (const event of posting) {
@@ -259,7 +313,7 @@ function toStats(row: BoardStored, events: EventStored[], now: Date): BoardStats
   }
   let open_postings_seen = open.size;
   if (posting.length === 0) {
-    const found = asNumber(lastPayload.postings_found);
+    const found = asNumber(successPayload.postings_found);
     if (found != null && found >= 0) open_postings_seen = found;
   }
   const byJob = new Map<string, { submitted: boolean; pos: PositionApplied }>();
@@ -303,8 +357,12 @@ function toStats(row: BoardStored, events: EventStored[], now: Date): BoardStats
     company_id: row.company_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
-    last_checked_at: last?.ts ?? null,
-    hours_since_last_check: last ? hoursSince(last.ts, now) : null,
+    last_checked_at: lastSuccess?.ts ?? null,
+    last_attempt_at: last?.ts ?? null,
+    last_success_at: lastSuccess?.ts ?? null,
+    hours_since_last_check: lastSuccess ? hoursSince(lastSuccess.ts, now) : null,
+    consecutive_failures,
+    last_error: last && checkFailed(lastPayload) ? asString(lastPayload.error) : null,
     total_checks: checks.length,
     open_postings_seen,
     open_positions: [...open.values()],
@@ -317,6 +375,8 @@ function toStats(row: BoardStored, events: EventStored[], now: Date): BoardStats
       new_postings: asNumber(lastPayload.new_postings),
       closed_postings: asNumber(lastPayload.closed_postings),
       error: asString(lastPayload.error),
+      truncated: lastPayload.truncated === true,
+      http_status: asNumber(lastPayload.http_status),
       new_positions: after(["posting_seen", "posting_returned"]),
       closed_positions: after(["posting_gone"]),
     } : null,
@@ -363,6 +423,29 @@ BEFORE DELETE ON board_events
 BEGIN
   SELECT RAISE(ABORT, 'append-only: board_events cannot be deleted');
 END;
+CREATE INDEX IF NOT EXISTS idx_board_events_kind ON board_events(board_id, kind, id);
+CREATE TABLE IF NOT EXISTS board_summary (
+  board_id                INTEGER PRIMARY KEY REFERENCES board_registry(id) ON DELETE CASCADE,
+  last_attempt_at         TEXT,
+  last_success_at         TEXT,
+  consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+  total_checks            INTEGER NOT NULL DEFAULT 0,
+  open_postings_seen      INTEGER NOT NULL DEFAULT 0,
+  applications_submitted  INTEGER NOT NULL DEFAULT 0,
+  open_positions_json     TEXT NOT NULL DEFAULT '[]',
+  positions_json          TEXT NOT NULL DEFAULT '[]',
+  last_error              TEXT,
+  last_method             TEXT,
+  last_postings_found     INTEGER,
+  last_new_count          INTEGER,
+  last_closed_count       INTEGER,
+  last_new_json           TEXT NOT NULL DEFAULT '[]',
+  last_closed_json        TEXT NOT NULL DEFAULT '[]',
+  last_check_at           TEXT,
+  last_truncated          INTEGER NOT NULL DEFAULT 0,
+  last_http_status        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_board_summary_success ON board_summary(last_success_at);
 `);
 
   const statKindSql = STAT_KINDS.map(() => "?").join(",");
@@ -375,6 +458,7 @@ END;
   function insertBoardEvent(input: {
     board_id: number; kind: string; summary: string;
     payload?: Record<string, unknown> | null; ref?: string | null; ts?: string;
+    refresh?: boolean;
   }): BoardEvent {
     const ts = input.ts ? canonicalTs(input.ts) : nowIso();
     const payload = input.payload && Object.keys(input.payload).length ? JSON.stringify(input.payload) : null;
@@ -382,7 +466,9 @@ END;
     const info = db.prepare(
       "INSERT INTO board_events (board_id, ts, kind, summary, payload_json, ref) VALUES (?, ?, ?, ?, ?, ?)",
     ).run(input.board_id, ts, input.kind, input.summary, payload, input.ref ?? null);
-    return readEvent(Number(info.lastInsertRowid));
+    const event = readEvent(Number(info.lastInsertRowid));
+    if (input.refresh !== false) refreshSummary(input.board_id);
+    return event;
   }
   function catalogCompanyId(board_type: string, board_key: string): number | null {
     const row = db.prepare(
@@ -392,7 +478,10 @@ END;
   }
   function findBoard(board_type: string, board_key: string | null, name: string): BoardStored | undefined {
     if (board_key) {
-      const byKey = db.prepare("SELECT * FROM board_registry WHERE board_type=? AND board_key=?").get(board_type, board_key) as BoardStored | undefined;
+      const byKey = db.prepare(
+        `SELECT * FROM board_registry WHERE board_type=? AND lower(board_key)=lower(?)
+         ORDER BY CASE WHEN board_key=? THEN 0 ELSE 1 END, id LIMIT 1`,
+      ).get(board_type, board_key, board_key) as BoardStored | undefined;
       if (byKey) return byKey;
     }
     return db.prepare(
@@ -405,13 +494,153 @@ END;
        WHERE board_id=? AND kind IN (${statKindSql}) ORDER BY id ASC`,
     ).all(boardId, ...STAT_KINDS) as EventStored[];
   }
+  function refreshSummary(boardId: number): void {
+    const row = db.prepare("SELECT * FROM board_registry WHERE id=?").get(boardId) as BoardStored | undefined;
+    if (!row) return;
+    const stats = toStats(row, eventsFor(boardId), new Date());
+    const last = stats.last_check;
+    db.prepare(
+      `INSERT INTO board_summary (
+         board_id, last_attempt_at, last_success_at, consecutive_failures, total_checks,
+         open_postings_seen, applications_submitted, open_positions_json, positions_json,
+         last_error, last_method, last_postings_found, last_new_count, last_closed_count,
+         last_new_json, last_closed_json, last_check_at, last_truncated, last_http_status
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(board_id) DO UPDATE SET
+         last_attempt_at=excluded.last_attempt_at,
+         last_success_at=excluded.last_success_at,
+         consecutive_failures=excluded.consecutive_failures,
+         total_checks=excluded.total_checks,
+         open_postings_seen=excluded.open_postings_seen,
+         applications_submitted=excluded.applications_submitted,
+         open_positions_json=excluded.open_positions_json,
+         positions_json=excluded.positions_json,
+         last_error=excluded.last_error,
+         last_method=excluded.last_method,
+         last_postings_found=excluded.last_postings_found,
+         last_new_count=excluded.last_new_count,
+         last_closed_count=excluded.last_closed_count,
+         last_new_json=excluded.last_new_json,
+         last_closed_json=excluded.last_closed_json,
+         last_check_at=excluded.last_check_at,
+         last_truncated=excluded.last_truncated,
+         last_http_status=excluded.last_http_status`,
+    ).run(
+      boardId,
+      stats.last_attempt_at,
+      stats.last_success_at,
+      stats.consecutive_failures,
+      stats.total_checks,
+      stats.open_postings_seen,
+      stats.applications_submitted,
+      JSON.stringify(stats.open_positions),
+      JSON.stringify(stats.positions_applied_to),
+      stats.last_error,
+      last?.method ?? null,
+      last?.postings_found ?? null,
+      last?.new_postings ?? null,
+      last?.closed_postings ?? null,
+      JSON.stringify(last?.new_positions ?? []),
+      JSON.stringify(last?.closed_positions ?? []),
+      last?.at ?? null,
+      last?.truncated ? 1 : 0,
+      last?.http_status ?? null,
+    );
+  }
+  interface SummaryStored {
+    last_attempt_at: string | null;
+    last_success_at: string | null;
+    consecutive_failures: number;
+    total_checks: number;
+    open_postings_seen: number;
+    applications_submitted: number;
+    open_positions_json: string | null;
+    positions_json: string | null;
+    last_error: string | null;
+    last_method: string | null;
+    last_postings_found: number | null;
+    last_new_count: number | null;
+    last_closed_count: number | null;
+    last_new_json: string | null;
+    last_closed_json: string | null;
+    last_check_at: string | null;
+    last_truncated: number | null;
+    last_http_status: number | null;
+  }
+  function hydrate(row: BoardStored & SummaryStored, now: Date, detail: BoardDetail): BoardStats {
+    const full = detail === true;
+    const applications = full || detail === "applications";
+    const last_check = row.last_check_at ? {
+      at: row.last_check_at,
+      method: row.last_method,
+      postings_found: row.last_postings_found,
+      new_postings: row.last_new_count,
+      closed_postings: row.last_closed_count,
+      error: row.last_error,
+      truncated: row.last_truncated === 1,
+      http_status: row.last_http_status,
+      new_positions: full ? parseJsonArray<OpenPosition>(row.last_new_json) : [],
+      closed_positions: full ? parseJsonArray<OpenPosition>(row.last_closed_json) : [],
+    } : null;
+    return {
+      id: row.id,
+      name: row.name,
+      domain: row.domain,
+      careers_url: row.careers_url,
+      board_type: row.board_type,
+      board_key: row.board_key,
+      tags: parseTags(row.tags),
+      notes: row.notes,
+      active: row.active === 1,
+      company_id: row.company_id,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      last_checked_at: row.last_success_at,
+      last_attempt_at: row.last_attempt_at,
+      last_success_at: row.last_success_at,
+      hours_since_last_check: hoursSince(row.last_success_at, now),
+      consecutive_failures: row.consecutive_failures,
+      last_error: row.last_error,
+      total_checks: row.total_checks,
+      open_postings_seen: row.open_postings_seen,
+      open_positions: full ? parseJsonArray<OpenPosition>(row.open_positions_json) : [],
+      applications_submitted: row.applications_submitted,
+      positions_applied_to: applications ? parseJsonArray<PositionApplied>(row.positions_json) : [],
+      last_check,
+    };
+  }
+  function tagFilter(tag: string | undefined): { sql: string; params: string[] } {
+    if (tag === undefined || tag === "") return { sql: "", params: [] };
+    const cleaned = validateTags([tag]);
+    if (cleaned.length !== 1) throw new Error("invalid tag");
+    return { sql: " AND (',' || COALESCE(r.tags, '') || ',') LIKE ?", params: [`%,${cleaned[0]},%`] };
+  }
+  function selectStats(where: string, params: unknown[], now: Date, detail: BoardDetail, order: string, limit?: number, offset?: number): BoardStats[] {
+    const jsonCols = detail === true
+      ? "s.open_positions_json, s.positions_json, s.last_new_json, s.last_closed_json"
+      : detail === "applications"
+        ? "NULL AS open_positions_json, s.positions_json, NULL AS last_new_json, NULL AS last_closed_json"
+        : "NULL AS open_positions_json, NULL AS positions_json, NULL AS last_new_json, NULL AS last_closed_json";
+    const rows = db.prepare(
+      `SELECT r.*, s.last_attempt_at, s.last_success_at, s.consecutive_failures, s.total_checks,
+              s.open_postings_seen, s.applications_submitted, s.last_error, s.last_method,
+              s.last_postings_found, s.last_new_count, s.last_closed_count, s.last_check_at,
+              s.last_truncated, s.last_http_status, ${jsonCols}
+       FROM board_registry r
+       JOIN board_summary s ON s.board_id = r.id
+       ${where}
+       ${order}
+       LIMIT ? OFFSET ?`,
+    ).all(...params, limit ?? -1, offset ?? 0) as (BoardStored & SummaryStored)[];
+    return rows.map((row) => hydrate(row, now, detail));
+  }
 
   function registerBoard(input: RegisterBoardInput): RegisterBoardResult {
     const name = cleanName(input.name);
     const board_type = cleanType(input.board_type);
     const identity = registrationIdentity(board_type, input.board_key, input.careers_url);
-    const lookupKey = identity ? identity.key : (input.board_key === undefined ? null : cleanKey(input.board_key));
-    const nextKey = identity ? identity.key : (input.board_key === undefined ? undefined : cleanKey(input.board_key));
+    const lookupKey = identity ? identity.key : (input.board_key === undefined ? null : cleanKey(input.board_key, board_type));
+    const nextKey = identity ? identity.key : (input.board_key === undefined ? undefined : cleanKey(input.board_key, board_type));
     const nextUrl = identity ? cleanCareersUrl(identity.careers_url) : (input.careers_url === undefined ? undefined : cleanCareersUrl(input.careers_url));
     return db.transaction((): RegisterBoardResult => {
       const existing = findBoard(board_type, lookupKey, name);
@@ -440,7 +669,9 @@ END;
           summary: `registered ${name} (${board_type}${key ? `/${key}` : ""})`,
           payload: { name, board_type, board_key: key, domain, careers_url, tags: parseTags(tags) },
           ts: stamp,
+          refresh: false,
         });
+        refreshSummary(id);
         return { id, inserted: true };
       }
       const key = nextKey === undefined ? existing.board_key : nextKey;
@@ -496,32 +727,25 @@ END;
     return insertBoardEvent({ board_id: input.board_id, kind, summary, payload, ref, ts: input.ts });
   }
 
-  function listBoardStats(now = new Date()): BoardStats[] {
-    const rows = db.prepare("SELECT * FROM board_registry ORDER BY id").all() as BoardStored[];
-    const grouped = new Map<number, EventStored[]>();
-    const events = db.prepare(
-      `SELECT id, board_id, ts, kind, summary, payload_json, ref FROM board_events
-       WHERE kind IN (${statKindSql}) ORDER BY id ASC`,
-    ).all(...STAT_KINDS) as EventStored[];
-    for (const event of events) {
-      const list = grouped.get(event.board_id);
-      if (list) list.push(event);
-      else grouped.set(event.board_id, [event]);
-    }
-    return rows
-      .map((row) => toStats(row, grouped.get(row.id) ?? [], now))
-      .sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name) || a.id - b.id);
+  function listBoardStats(now = new Date(), opts: BoardListOptions = {}): BoardStats[] {
+    const tag = tagFilter(opts.tag);
+    const offset = opts.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("offset must be a non-negative integer");
+    if (opts.limit !== undefined) clampLimit(opts.limit, 1, 100_000);
+    return selectStats("WHERE 1=1" + tag.sql, tag.params, now, opts.detail === undefined ? false : opts.detail, "ORDER BY r.active DESC, r.name COLLATE NOCASE, r.id", opts.limit, offset);
   }
   function boardStats(id: number, now = new Date()): BoardStats | undefined {
     if (!Number.isSafeInteger(id) || id < 1) return undefined;
-    const row = db.prepare("SELECT * FROM board_registry WHERE id=?").get(id) as BoardStored | undefined;
-    if (!row) return undefined;
-    return toStats(row, eventsFor(id), now);
+    const rows = selectStats("WHERE r.id=?", [id], now, true, "", 1, 0);
+    return rows[0];
   }
-  function staleBoards(olderThanHours: number, now = new Date()): BoardStats[] {
+  function staleBoards(olderThanHours: number, now = new Date(), opts: BoardListOptions = {}): BoardStats[] {
     if (typeof olderThanHours !== "number" || !Number.isFinite(olderThanHours) || olderThanHours < 0)
       throw new Error("olderThanHours must be a non-negative number");
-    return listBoardStats(now)
+    const offset = opts.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("offset must be a non-negative integer");
+    if (opts.limit !== undefined) clampLimit(opts.limit, 1, 100_000);
+    const ranked = listBoardStats(now, { tag: opts.tag, detail: opts.detail === undefined ? false : opts.detail })
       .filter((board) => board.active && (board.hours_since_last_check === null || board.hours_since_last_check >= olderThanHours))
       .sort((a, b) => {
         if (a.hours_since_last_check === null && b.hours_since_last_check === null) return a.name.localeCompare(b.name);
@@ -529,6 +753,9 @@ END;
         if (b.hours_since_last_check === null) return 1;
         return b.hours_since_last_check - a.hours_since_last_check || a.name.localeCompare(b.name);
       });
+    const start = offset;
+    const end = opts.limit === undefined ? undefined : start + opts.limit;
+    return ranked.slice(start, end);
   }
   function recentBoardEvents(opts: { board_id?: number; limit?: number } = {}): BoardEvent[] {
     const limit = clampLimit(opts.limit, 50, 500);
@@ -546,6 +773,7 @@ END;
       summary: `${label}: ${title}`.slice(0, 500),
       payload: { job_id: posting.job_id, title: posting.title, source_url: posting.source_url },
       ref: String(posting.job_id),
+      refresh: false,
     });
   }
   function recordBoardFetch(input: BoardFetchInput): BoardFetchRecord {
@@ -553,17 +781,20 @@ END;
     let board_key: string | null;
     try {
       board_type = cleanType(input.board_type);
-      board_key = cleanKey(input.board_key);
+      board_key = cleanKey(input.board_key, board_type);
     } catch { return { recorded: false }; }
     if (!board_key) return { recorded: false };
-    const board = db.prepare("SELECT * FROM board_registry WHERE board_type=? AND board_key=?").get(board_type, board_key) as BoardStored | undefined;
+    const board = db.prepare(
+      `SELECT * FROM board_registry WHERE board_type=? AND lower(board_key)=lower(?)
+       ORDER BY CASE WHEN board_key=? THEN 0 ELSE 1 END, id LIMIT 1`,
+    ).get(board_type, board_key, board_key) as BoardStored | undefined;
     if (!board) return { recorded: false };
     return db.transaction((): BoardFetchRecord => {
-      if (board.company_id == null && Number.isSafeInteger(input.company_id)) {
+      if (board.company_id == null && Number.isSafeInteger(input.company_id) && input.company_id >= 1) {
         db.prepare("UPDATE board_registry SET company_id=?, updated_at=? WHERE id=? AND company_id IS NULL")
           .run(input.company_id, nowIso(), board.id);
       }
-      const error = input.unreachable ? (input.error ?? "unreachable") : null;
+      const error = input.unreachable ? (typeof input.error === "string" && input.error.trim() ? input.error.trim() : "unreachable") : null;
       const payload: Record<string, unknown> = {
         method: "ats_api",
         postings_found: input.unreachable ? null : input.seen,
@@ -573,15 +804,18 @@ END;
         updated_postings: input.updated,
         error,
       };
+      if (input.truncated) payload.truncated = true;
+      if (input.http_status != null) payload.http_status = input.http_status;
       const summary = input.unreachable
-        ? `${board_type}/${board_key} check failed (${String(payload.error)})`
-        : `${board_type}/${board_key} checked via ats_api: ${input.seen} posting(s), ${input.new_postings.length} new, ${input.closed_postings.length} gone`;
-      const check = insertBoardEvent({ board_id: board.id, kind: "board_checked", summary, payload });
+        ? `${board_type}/${board.board_key} check failed (${String(payload.error)})`
+        : `${board_type}/${board.board_key} checked via ats_api: ${input.seen} posting(s), ${input.new_postings.length} new, ${input.closed_postings.length} gone`;
+      const check = insertBoardEvent({ board_id: board.id, kind: "board_checked", summary, payload, refresh: false });
       if (!input.unreachable) {
         for (const posting of input.new_postings) recordPosting("posting_seen", "first seen", board.id, posting);
         for (const posting of input.returned_postings) recordPosting("posting_returned", "returned", board.id, posting);
         for (const posting of input.closed_postings) recordPosting("posting_gone", "gone", board.id, posting);
       }
+      refreshSummary(board.id);
       return { recorded: true, board_id: board.id, event_id: check.id };
     })();
   }
@@ -595,7 +829,7 @@ END;
     const platform = (job.ats_platform ?? "").toLowerCase();
     const slug = (job.ats_slug ?? "").toLowerCase();
     const matches = db.prepare(
-      `SELECT id FROM board_registry WHERE company_id = ? OR (board_type = ? AND board_key = ?)`,
+      `SELECT id FROM board_registry WHERE company_id = ? OR (lower(board_type) = ? AND lower(board_key) = lower(?))`,
     ).all(job.company_id, platform, slug) as { id: number }[];
     const ids = [...new Set(matches.map((row) => row.id))];
     if (!ids.length) return;
@@ -611,16 +845,62 @@ END;
     for (const board_id of ids) insertBoardEvent({ board_id, kind, summary, payload, ref: String(job.id) });
   }
 
+  function updateBoard(input: UpdateBoardInput): { id: number } {
+    if (!Number.isSafeInteger(input.id) || input.id < 1) throw new Error("board_id must be a positive integer");
+    const existing = db.prepare("SELECT * FROM board_registry WHERE id=?").get(input.id) as BoardStored | undefined;
+    if (!existing) throw new Error(`no board ${input.id}`);
+    const name = input.name === undefined ? existing.name : cleanName(input.name);
+    const tags = input.tags === undefined ? existing.tags : serializeTags(validateTags(input.tags));
+    const notes = input.notes === undefined ? existing.notes : cleanNotes(input.notes);
+    const active = input.active === undefined ? existing.active : (input.active ? 1 : 0);
+    const domain = input.domain === undefined ? existing.domain : normalizeDomain(input.domain);
+    const careers_url = input.careers_url === undefined ? existing.careers_url : cleanCareersUrl(input.careers_url);
+    if (existing.board_key == null && name.toLowerCase() !== existing.name.toLowerCase()) {
+      const owner = db.prepare(
+        "SELECT id FROM board_registry WHERE board_type=? AND board_key IS NULL AND lower(name)=lower(?) AND id<>?",
+      ).get(existing.board_type, name, existing.id) as { id: number } | undefined;
+      if (owner) throw new Error(`board ${existing.board_type}/${name} is already registered`);
+    }
+    db.prepare(
+      `UPDATE board_registry SET name=?, domain=?, careers_url=?, tags=?, notes=?, active=?, updated_at=? WHERE id=?`,
+    ).run(name, domain, careers_url, tags, notes, active, nowIso(), existing.id);
+    return { id: existing.id };
+  }
+
+  function recordManualCheck(input: ManualCheckInput): BoardEvent {
+    if (!Number.isSafeInteger(input.board_id) || input.board_id < 1) throw new Error("board_id must be a positive integer");
+    if (!Number.isSafeInteger(input.postings) || input.postings < 0) throw new Error("postings must be a non-negative integer");
+    const board = db.prepare("SELECT id, name, board_type FROM board_registry WHERE id=?").get(input.board_id) as { id: number; name: string; board_type: string } | undefined;
+    if (!board) throw new Error(`no board ${input.board_id}`);
+    const note = input.note == null || input.note === "" ? null : cleanNotes(input.note);
+    const method = board.board_type === "browser" ? "browser" : "manual";
+    const summary = `${board.name} ${method} check: ${input.postings} posting(s)${note ? ` — ${note}` : ""}`.slice(0, 500);
+    return appendBoardEvent({
+      board_id: board.id,
+      kind: "board_checked",
+      summary,
+      payload: { method, postings_found: input.postings, ...(note ? { note } : {}) },
+      ts: input.ts,
+    });
+  }
+
+  const missingSummaries = db.prepare(
+    "SELECT id FROM board_registry WHERE id NOT IN (SELECT board_id FROM board_summary)",
+  ).all() as { id: number }[];
+  for (const row of missingSummaries) refreshSummary(row.id);
+
   return {
     KNOWN_BOARD_TYPES,
     BOARD_EVENT_KINDS,
     registerBoard,
+    updateBoard,
     appendBoardEvent,
     listBoardStats,
     boardStats,
     staleBoards,
     recentBoardEvents,
     recordBoardFetch,
+    recordManualCheck,
     recordApplicationOnLedger,
     hoursSince,
     nowIso,
